@@ -1,6 +1,8 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -20,8 +22,37 @@ class AccioClient {
     this.config = config;
   }
 
-  async requestJson(path, init = {}) {
-    const response = await fetch(`${this.config.baseUrl}${path}`, init);
+  normalizeRequestedModel(model) {
+    const value = String(model || "").trim();
+
+    if (!value) {
+      return null;
+    }
+
+    if (["accio-bridge", "auto", "default"].includes(value)) {
+      return null;
+    }
+
+    return value;
+  }
+
+  isRetriableError(error) {
+    if (!error) {
+      return false;
+    }
+
+    if (error instanceof HttpError) {
+      return error.status === 429 || error.status >= 500;
+    }
+
+    const message = String(error.message || error);
+    return /timed out|ECONNREFUSED|ECONNRESET|closed before the request finished/i.test(
+      message
+    );
+  }
+
+  async requestJson(pathname, init = {}) {
+    const response = await fetch(`${this.config.baseUrl}${pathname}`, init);
     const text = await response.text();
     const contentType = response.headers.get("content-type") || "";
     const parsed =
@@ -42,6 +73,10 @@ class AccioClient {
     return this.requestJson("/auth/status");
   }
 
+  async getAuthDebugStatus() {
+    return this.requestJson("/debug/auth/status");
+  }
+
   async createConversation(name) {
     return this.requestJson("/conversation", {
       method: "POST",
@@ -54,6 +89,156 @@ class AccioClient {
         agentId: this.config.agentId
       })
     });
+  }
+
+  getConversationLogDirectory() {
+    if (!this.config.accountId) {
+      return null;
+    }
+
+    return path.join(
+      this.config.accioHome,
+      "accounts",
+      this.config.accountId,
+      "conversations",
+      "dm"
+    );
+  }
+
+  getConversationLogDirectories() {
+    const directories = [];
+    const primary = this.getConversationLogDirectory();
+
+    if (primary) {
+      directories.push(primary);
+    }
+
+    try {
+      const accountsRoot = path.join(this.config.accioHome, "accounts");
+      const accountIds = fs
+        .readdirSync(accountsRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && entry.name !== "guest")
+        .map((entry) => entry.name);
+
+      for (const accountId of accountIds) {
+        const directory = path.join(
+          accountsRoot,
+          accountId,
+          "conversations",
+          "dm"
+        );
+
+        if (!directories.includes(directory)) {
+          directories.push(directory);
+        }
+      }
+    } catch {}
+
+    return directories;
+  }
+
+  readConversationMessages(conversationId) {
+    const messages = [];
+
+    for (const directory of this.getConversationLogDirectories()) {
+      try {
+        const files = fs
+          .readdirSync(directory)
+          .filter(
+            (file) =>
+              file.startsWith(`${conversationId}.message_`) && file.endsWith(".jsonl")
+          )
+          .sort();
+
+        for (const file of files) {
+          const filePath = path.join(directory, file);
+          const lines = fs.readFileSync(filePath, "utf8").split("\n");
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+
+            if (!trimmed) {
+              continue;
+            }
+
+            try {
+              messages.push(JSON.parse(trimmed));
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+
+    return messages;
+  }
+
+  collectConversationArtifacts(conversationId) {
+    if (!conversationId) {
+      return {
+        messageId: null,
+        toolCalls: [],
+        toolResults: []
+      };
+    }
+
+    const messages = this.readConversationMessages(conversationId);
+    const lastRequestIndex = [...messages]
+      .map((message, index) => ({ index, message }))
+      .filter((entry) => entry.message && entry.message.role === "req")
+      .map((entry) => entry.index)
+      .pop();
+    const turnMessages =
+      typeof lastRequestIndex === "number" ? messages.slice(lastRequestIndex + 1) : messages;
+    const toolCalls = [];
+    const seenToolCalls = new Set();
+    const toolResults = turnMessages
+      .filter(
+        (message) =>
+          message &&
+          message.role === "tool" &&
+          message.tool_call_id
+      )
+      .map((message) => ({
+        tool_use_id: message.tool_call_id,
+        name: message.name || "unknown",
+        content: message.content || "",
+        is_error: Boolean(message.metadata && message.metadata.is_error)
+      }));
+
+    for (const message of turnMessages) {
+      if (
+        !message ||
+        message.role !== "res" ||
+        !Array.isArray(message.tool_calls)
+      ) {
+        continue;
+      }
+
+      for (const toolCall of message.tool_calls) {
+        if (!toolCall || !toolCall.name || seenToolCalls.has(toolCall.id)) {
+          continue;
+        }
+
+        seenToolCalls.add(toolCall.id);
+        toolCalls.push({
+          id: toolCall.id || `tool_${Date.now()}`,
+          name: toolCall.name,
+          input: toolCall.arguments || toolCall.input || {}
+        });
+      }
+    }
+
+    const resolvedMessageId =
+      [...turnMessages]
+        .reverse()
+        .find((message) => message && message.role === "res" && message.messageId)
+        ?.messageId || null;
+
+    return {
+      messageId: resolvedMessageId,
+      toolCalls,
+      toolResults
+    };
   }
 
   buildSource() {
@@ -70,6 +255,8 @@ class AccioClient {
   }
 
   buildSendQueryPayload(input) {
+    const requestedModel = this.normalizeRequestedModel(input.model);
+
     return {
       type: "req",
       method: "sendQuery",
@@ -92,7 +279,7 @@ class AccioClient {
         ts: Date.now(),
         extra: {},
         source: this.buildSource(),
-        ...(input.model ? { model: input.model } : {}),
+        ...(requestedModel ? { model: requestedModel } : {}),
         atIds: []
       }
     };
@@ -107,7 +294,6 @@ class AccioClient {
       workspacePath: input.workspacePath,
       model: input.model
     });
-
     const wsUrl =
       this.config.baseUrl.replace(/^http/, "ws") +
       `/websocket/connect?clientId=${encodeURIComponent(clientId)}`;
@@ -116,13 +302,13 @@ class AccioClient {
       const ws = new WebSocket(wsUrl);
       const state = {
         ack: null,
+        appendEvents: [],
+        channelResponse: null,
         finalMessage: null,
         finalText: "",
         messageId: null,
-        uniqueId: null,
         textSnapshot: "",
-        appendEvents: [],
-        channelResponse: null
+        uniqueId: null
       };
 
       let settled = false;
@@ -134,6 +320,7 @@ class AccioClient {
       const cleanup = () => {
         clearTimeout(timeout);
         clearTimeout(finishTimer);
+
         try {
           ws.close();
         } catch {}
@@ -283,21 +470,51 @@ class AccioClient {
   }
 
   async executeQuery(input) {
-    let conversationId = input.conversationId;
+    const maxAttempts = Math.max(1, Number(this.config.maxRetries || 0) + 1);
+    let attempt = 0;
+    let lastError = null;
 
-    if (!conversationId) {
-      const title = (input.title || input.query || "Bridge Request").slice(0, 48);
-      const created = await this.createConversation(title);
-      conversationId = created.data.id;
+    while (attempt < maxAttempts) {
+      attempt += 1;
+
+      try {
+        let conversationId = input.conversationId;
+
+        if (!conversationId) {
+          const title = (input.title || input.query || "Bridge Request").slice(0, 48);
+          const created = await this.createConversation(title);
+          conversationId = created.data.id;
+        }
+
+        const result = await this.runQuery({
+          conversationId,
+          model: input.model,
+          onEvent: input.onEvent,
+          query: input.query,
+          workspacePath: input.workspacePath
+        });
+
+        return {
+          ...result,
+          conversationId,
+          ...this.collectConversationArtifacts(conversationId)
+        };
+      } catch (error) {
+        lastError = error;
+
+        if (!this.isRetriableError(error) || attempt >= maxAttempts) {
+          throw error;
+        }
+
+        const backoffMs = Math.min(
+          this.config.retryBaseMs * 2 ** (attempt - 1),
+          this.config.retryMaxDelayMs
+        );
+        await delay(backoffMs);
+      }
     }
 
-    return this.runQuery({
-      conversationId,
-      model: input.model,
-      onEvent: input.onEvent,
-      query: input.query,
-      workspacePath: input.workspacePath
-    });
+    throw lastError;
   }
 }
 

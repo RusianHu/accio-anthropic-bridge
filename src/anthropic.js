@@ -1,5 +1,30 @@
 "use strict";
 
+function normalizeSystemPrompt(system) {
+  if (typeof system === "string") {
+    return system;
+  }
+
+  if (!Array.isArray(system)) {
+    return "";
+  }
+
+  return system
+    .map((block) => {
+      if (!block || typeof block !== "object") {
+        return "";
+      }
+
+      if (block.type === "text") {
+        return block.text || "";
+      }
+
+      return `[Unsupported system block: ${block.type || "unknown"}]`;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
 function normalizeContent(content) {
   if (typeof content === "string") {
     return content;
@@ -24,7 +49,9 @@ function normalizeContent(content) {
       }
 
       if (block.type === "tool_use") {
-        return `[Tool use omitted by bridge: ${block.name || "unknown"}]`;
+        return `[Assistant requested tool ${block.name || "unknown"} id=${
+          block.id || "unknown"
+        }]\n${JSON.stringify(block.input || {})}`;
       }
 
       if (block.type === "tool_result") {
@@ -32,7 +59,7 @@ function normalizeContent(content) {
           typeof block.content === "string"
             ? block.content
             : JSON.stringify(block.content || "");
-        return `[Tool result]\n${value}`;
+        return `[Tool result for ${block.tool_use_id || "unknown"}]\n${value}`;
       }
 
       return `[Unsupported content block: ${block.type || "unknown"}]`;
@@ -43,10 +70,33 @@ function normalizeContent(content) {
 
 function flattenAnthropicRequest(body) {
   const lines = [];
+  const system = normalizeSystemPrompt(body.system);
 
-  if (typeof body.system === "string" && body.system.trim()) {
+  if (system.trim()) {
     lines.push("System:");
-    lines.push(body.system.trim());
+    lines.push(system.trim());
+    lines.push("");
+  }
+
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    lines.push("Available tools:");
+
+    for (const tool of body.tools) {
+      if (!tool || typeof tool !== "object" || !tool.name) {
+        continue;
+      }
+
+      lines.push(`- ${tool.name}`);
+
+      if (tool.description) {
+        lines.push(`  Description: ${tool.description}`);
+      }
+
+      if (tool.input_schema && Object.keys(tool.input_schema).length > 0) {
+        lines.push(`  JSON schema: ${JSON.stringify(tool.input_schema)}`);
+      }
+    }
+
     lines.push("");
   }
 
@@ -75,40 +125,107 @@ function estimateTokens(text) {
 }
 
 function buildMessageResponse(body, text, extras = {}) {
+  const toolCalls = Array.isArray(extras.toolCalls) ? extras.toolCalls : [];
+  const content = [];
+
+  if (text || toolCalls.length === 0) {
+    content.push({
+      type: "text",
+      text: text || ""
+    });
+  }
+
+  for (const toolCall of toolCalls) {
+    content.push({
+      type: "tool_use",
+      id: toolCall.id,
+      name: toolCall.name,
+      input: toolCall.input || {}
+    });
+  }
+
   return {
     id: extras.id || `msg_${Date.now()}`,
     type: "message",
     role: "assistant",
     model: body.model || "accio-bridge",
-    content: [
-      {
-        type: "text",
-        text: text || ""
-      }
-    ],
-    stop_reason: extras.stopReason || "end_turn",
+    content,
+    stop_reason:
+      extras.stopReason || (toolCalls.length > 0 && !text ? "tool_use" : "end_turn"),
     stop_sequence: null,
     usage: {
       input_tokens: extras.inputTokens || 0,
       output_tokens: extras.outputTokens || 0
+    },
+    accio: {
+      conversation_id: extras.conversationId || null,
+      session_id: extras.sessionId || null,
+      tool_results: extras.toolResults || []
     }
   };
 }
 
-function buildErrorResponse(message, type) {
+function buildErrorResponse(message, type, extras = {}) {
   return {
     type: "error",
     error: {
       type: type || "api_error",
       message
-    }
+    },
+    ...(extras.details ? { details: extras.details } : {})
   };
+}
+
+function normalizeAccioToolCalls(toolCalls) {
+  return (Array.isArray(toolCalls) ? toolCalls : [])
+    .map((toolCall) => {
+      if (!toolCall || typeof toolCall !== "object" || !toolCall.name) {
+        return null;
+      }
+
+      return {
+        id: toolCall.id || `tool_${Date.now()}`,
+        name: toolCall.name,
+        input:
+          toolCall.input ||
+          toolCall.arguments ||
+          toolCall.args ||
+          toolCall.parameters ||
+          {}
+      };
+    })
+    .filter(Boolean);
+}
+
+function extractAccioToolCalls(result) {
+  const candidates = [
+    result && result.finalMessage && result.finalMessage.tool_calls,
+    result && result.finalMessage && result.finalMessage.toolCalls,
+    result && result.channelResponse && result.channelResponse.tool_calls,
+    result && result.channelResponse && result.channelResponse.toolCalls,
+    result &&
+      result.finalMessage &&
+      result.finalMessage.metadata &&
+      result.finalMessage.metadata.tool_calls
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeAccioToolCalls(candidate);
+
+    if (normalized.length > 0) {
+      return normalized;
+    }
+  }
+
+  return [];
 }
 
 module.exports = {
   buildErrorResponse,
   buildMessageResponse,
   estimateTokens,
+  extractAccioToolCalls,
   flattenAnthropicRequest,
-  normalizeContent
+  normalizeContent,
+  normalizeSystemPrompt
 };
