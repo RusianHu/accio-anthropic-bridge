@@ -1,0 +1,15 @@
+{
+  "strategy": "round_robin",
+  "accounts": [
+    {
+      "id": "acct_primary",
+      "accessToken": "replace-with-access-token",
+      "enabled": true
+    },
+    {
+      "id": "acct_backup",
+      "accessToken": "replace-with-access-token",
+      "enabled": false
+    }
+  ]
+}

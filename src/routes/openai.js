@@ -2,9 +2,9 @@
 
 const crypto = require("node:crypto");
 
-const { estimateTokens } = require("../anthropic");
+const { buildErrorResponse, estimateTokens } = require("../anthropic");
 const { buildDirectRequestFromOpenAi } = require("../direct-llm");
-const { classifyErrorType, resolveResultError } = require("../errors");
+const { classifyErrorType, resolveResultError, shouldFallbackToLocalTransport } = require("../errors");
 const { writeJson } = require("../http");
 const { readJsonBody } = require("../middleware/body-parser");
 const {
@@ -26,6 +26,10 @@ function generateId(prefix) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
 }
 
+function requestedAccountId(headers) {
+  return headers["x-accio-account-id"] || headers["x-account-id"] || null;
+}
+
 async function runDirectOpenAi(body, req, res, directClient) {
   const binding = resolveSessionBinding(req.headers, body, "openai");
   const request = buildDirectRequestFromOpenAi(body);
@@ -44,6 +48,7 @@ async function runDirectOpenAi(body, req, res, directClient) {
   });
 
   const result = await directClient.run(request, {
+    accountId: requestedAccountId(req.headers),
     onEvent(event) {
       if (!stream) {
         return;
@@ -108,7 +113,7 @@ async function handleChatCompletionsRequest(req, res, client, directClient, sess
       await runDirectOpenAi(body, req, res, directClient);
       return;
     } catch (error) {
-      if (client.config.transportMode === "direct-llm") {
+      if (client.config.transportMode === "direct-llm" || !shouldFallbackToLocalTransport(error)) {
         throw error;
       }
     }

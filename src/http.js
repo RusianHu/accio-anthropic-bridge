@@ -3,7 +3,7 @@
 const CORS_HEADERS = Object.freeze({
   "access-control-allow-origin": "*",
   "access-control-allow-headers":
-    "content-type,authorization,x-api-key,anthropic-version,x-accio-session-id,x-accio-conversation-id,x-session-id",
+    "content-type,authorization,x-api-key,anthropic-version,x-accio-session-id,x-accio-conversation-id,x-session-id,x-accio-account-id,x-account-id,x-request-id",
   "access-control-allow-methods": "GET,POST,OPTIONS"
 });
 

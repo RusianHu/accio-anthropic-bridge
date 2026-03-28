@@ -104,8 +104,10 @@ Accio 桌面端本地暴露了两类入口：
 ### 额外能力
 
 - `ACCIO_TRANSPORT=auto|direct-llm|local-ws`
+- `ACCIO_AUTH_MODE=auto|file|env|gateway`
 - `x-accio-session-id` / `x-session-id` 会话复用
 - `x-accio-conversation-id` 直接绑定已有 conversation
+- `x-accio-account-id` 指定外部账号凭证
 - 自动发现 Accio 本地账号、agent、workspace、source
 - 对本地网关超时/连接失败/429/5xx 做错误分类
 - 对可重试错误做指数退避重试
@@ -136,6 +138,45 @@ Accio 桌面端本地暴露了两类入口：
 
 默认 `ACCIO_TRANSPORT=auto`，会先尝试 `direct-llm`，失败后再回退到 `local-ws`。
 
+### 1.1 认证来源现在也支持分层选择
+
+除了 transport，当前 bridge 还支持独立的认证来源选择：
+
+- `ACCIO_AUTH_MODE=auto`
+  先尝试本地文件账号池，再尝试环境变量单账号，最后才回退到 Accio 本地网关
+- `ACCIO_AUTH_MODE=file`
+  只使用 `ACCIO_ACCOUNTS_PATH` 指向的账号池文件，不依赖 Accio 程序
+- `ACCIO_AUTH_MODE=env`
+  只使用 `ACCIO_ACCESS_TOKEN` 指定的单账号 token，不依赖 Accio 程序
+- `ACCIO_AUTH_MODE=gateway`
+  强制复用 Accio 本地登录态，行为与旧版本一致
+
+如果走到 `gateway` 这层而本地 `127.0.0.1:4097` 还没起来，bridge 现在默认会：
+
+1. 自动拉起 `ACCIO_APP_PATH` 指向的 Accio 桌面应用
+2. 轮询本地 `/debug/auth/ws-status` 直到能提取 `accessToken`
+3. 保持 Accio 继续运行，不会由 bridge 自动关闭
+
+相关开关：
+
+- `ACCIO_GATEWAY_AUTOSTART=1`
+- `ACCIO_APP_PATH=/Applications/Accio.app`
+- `ACCIO_GATEWAY_WAIT_MS=20000`
+- `ACCIO_GATEWAY_POLL_MS=500`
+
+其中 `ACCIO_APP_PATH` 现在支持自动发现：
+
+- macOS 优先探测 `/Applications/Accio.app`
+- 其次探测 `~/Applications/Accio.app`
+- 只有你手工覆盖时才使用自定义值
+
+如果你的目标是“单账号/多账号都不打开 Accio 也能直接请求上游模型”，就应该配合：
+
+```bash
+ACCIO_TRANSPORT=direct-llm
+ACCIO_AUTH_MODE=file
+```
+
 ### 2. direct LLM 如何工作
 
 收到 Anthropic 或 OpenAI 请求后，代理会：
@@ -144,6 +185,8 @@ Accio 桌面端本地暴露了两类入口：
 2. 把 Anthropic/OpenAI 的消息、工具、tool result 转成 Accio ADK LLM 请求
 3. 直接请求 `phoenix-gw` 的 `/api/adk/llm/generateContent`
 4. 把返回的 Claude / Accio SSE 事件重新封装成 Anthropic 或 OpenAI 兼容响应
+
+如果本次 direct LLM 需要从 `gateway` 兜底拿 token，bridge 会优先尝试文件账号池 / 环境变量账号；只有这些都不可用时，才会触发本地 Accio 自动拉起。
 
 ### 3. WebSocket 回退模式如何工作
 
@@ -241,6 +284,15 @@ npm run init-env -- --force
 
 ```bash
 ACCIO_TRANSPORT=auto
+ACCIO_AUTH_MODE=auto
+ACCIO_AUTH_STRATEGY=round_robin
+ACCIO_ACCOUNTS_PATH=config/accounts.json
+ACCIO_ACCESS_TOKEN=
+ACCIO_AUTH_ACCOUNT_ID=env-default
+ACCIO_GATEWAY_AUTOSTART=1
+ACCIO_APP_PATH=/Applications/Accio.app
+ACCIO_GATEWAY_WAIT_MS=20000
+ACCIO_GATEWAY_POLL_MS=500
 ACCIO_DIRECT_LLM_BASE_URL=https://phoenix-gw.alibaba.com/api/adk/llm
 ```
 
@@ -249,6 +301,53 @@ ACCIO_DIRECT_LLM_BASE_URL=https://phoenix-gw.alibaba.com/api/adk/llm
 ```text
 config/model-aliases.json
 ```
+
+如果你要脱离 Accio 程序运行，建议复制下面这个模板并填入自己的 token：
+
+```text
+config/accounts.example.json
+```
+
+对应的最小配置例如：
+
+```bash
+ACCIO_TRANSPORT=direct-llm
+ACCIO_AUTH_MODE=file
+ACCIO_ACCOUNTS_PATH=config/accounts.json
+```
+
+文件内容：
+
+```json
+{
+  "strategy": "round_robin",
+  "accounts": [
+    {
+      "id": "acct_primary",
+      "accessToken": "replace-with-access-token",
+      "enabled": true
+    }
+  ]
+}
+```
+
+如果你只想用一个 token，也可以不写账号池文件，直接用环境变量：
+
+```bash
+ACCIO_TRANSPORT=direct-llm
+ACCIO_AUTH_MODE=env
+ACCIO_ACCESS_TOKEN=replace-with-access-token
+ACCIO_AUTH_ACCOUNT_ID=env-default
+```
+
+如果你暂时没有手动导出的 token，也可以让 bridge 代你抓一份，并持久化到账号池文件：
+
+```bash
+npm run capture-token -- --write-file --account-id acct_primary
+```
+
+这个命令会读取 `.env`，在需要时自动拉起 Accio，抓到 token 后写入 `ACCIO_ACCOUNTS_PATH`，默认也会在成功后自动关闭刚刚拉起的 Accio。
+这个命令会读取 `.env`，在需要时自动拉起 Accio，抓到 token 后写入 `ACCIO_ACCOUNTS_PATH`。bridge 不会自动关闭 Accio。
 
 默认监听：
 
@@ -419,6 +518,18 @@ claude
 
 这里的 `ANTHROPIC_API_KEY` 只是为了满足某些客户端的本地校验。代理本身不校验这个值。
 
+如果你启用了多账号池，还可以按请求显式指定账号：
+
+```bash
+curl http://127.0.0.1:8082/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-accio-account-id: acct_primary' \
+  -d '{
+    "model": "accio-bridge",
+    "messages": [{ "role": "user", "content": "请只回复 OK" }]
+  }'
+```
+
 ## 测试
 
 项目现在带了零依赖单测，可以直接跑：
@@ -476,6 +587,16 @@ LOG_LEVEL=debug
   session 到 conversation 的持久化映射
 - [config/model-aliases.json](/Users/snow/accio-anthropic-bridge/config/model-aliases.json)
   可编辑的模型别名映射
+- [config/accounts.example.json](/Users/snow/accio-anthropic-bridge/config/accounts.example.json)
+  单账号/多账号外部凭证池模板
+- [src/auth-provider.js](/Users/snow/accio-anthropic-bridge/src/auth-provider.js)
+  认证来源选择、账号池轮询、账号失效熔断
+- [src/gateway-manager.js](/Users/snow/accio-anthropic-bridge/src/gateway-manager.js)
+  本地网关探测、自动拉起 Accio、抓取 gateway token、可选自动退出
+- [scripts/capture-token.js](/Users/snow/accio-anthropic-bridge/scripts/capture-token.js)
+  显式抓取 Accio token 并写入账号池文件
+- [src/env-file.js](/Users/snow/accio-anthropic-bridge/src/env-file.js)
+  `.env` 解析与复用加载
 - [src/anthropic.js](/Users/snow/accio-anthropic-bridge/src/anthropic.js)
   Anthropic 请求压平和响应映射
 - [src/openai.js](/Users/snow/accio-anthropic-bridge/src/openai.js)

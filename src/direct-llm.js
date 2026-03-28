@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 
 const modelAliases = require("../config/model-aliases.json");
 
+const { extractAccessToken } = require("./gateway-manager");
 const { normalizeRequestedModel } = require("./model");
 
 function safeJsonParse(value, fallback = null) {
@@ -361,6 +362,7 @@ class DirectResponseAccumulator {
     this.stopReason = null;
     this.usage = null;
     this.currentTool = null;
+    this.error = null;
   }
 
   applyNormalizedParts(parts, onEvent) {
@@ -474,6 +476,11 @@ class DirectResponseAccumulator {
   }
 
   applyFrame(frame, onEvent) {
+    if (frame && (frame.error_code || frame.error_message)) {
+      this.error = new UpstreamSseError(frame);
+      return;
+    }
+
     if (frame.id) {
       this.id = frame.id;
     }
@@ -578,33 +585,233 @@ function sanitizeErrorText(text, token) {
   return text.replace(new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), maskToken(token));
 }
 
+function sanitizeErrorBody(value, token) {
+  if (value == null) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    return sanitizeErrorText(value, token);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeErrorBody(item, token));
+  }
+
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, sanitizeErrorBody(item, token)])
+    );
+  }
+
+  return value;
+}
+
+function extractErrorMessage(parsed, fallback) {
+  if (!parsed || typeof parsed !== "object") {
+    return fallback;
+  }
+
+  if (parsed.error && typeof parsed.error === "object") {
+    if (typeof parsed.error.message === "string" && parsed.error.message.trim()) {
+      return parsed.error.message.trim();
+    }
+
+    if (typeof parsed.error.msg === "string" && parsed.error.msg.trim()) {
+      return parsed.error.msg.trim();
+    }
+  }
+
+  if (typeof parsed.message === "string" && parsed.message.trim()) {
+    return parsed.message.trim();
+  }
+
+  if (typeof parsed.msg === "string" && parsed.msg.trim()) {
+    return parsed.msg.trim();
+  }
+
+  return fallback;
+}
+
+function extractErrorType(parsed) {
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+
+  if (parsed.error && typeof parsed.error === "object" && typeof parsed.error.type === "string") {
+    return parsed.error.type;
+  }
+
+  if (typeof parsed.type === "string") {
+    return parsed.type;
+  }
+
+  return null;
+}
+
+function mapUpstreamErrorStatus(errorCode) {
+  const code = Number(errorCode) || 0;
+
+  if (code === 400) {
+    return 400;
+  }
+
+  if (code === 401 || code === 402 || code === 403) {
+    return 401;
+  }
+
+  if (code === 404) {
+    return 404;
+  }
+
+  if (code === 408) {
+    return 408;
+  }
+
+  if (code === 429) {
+    return 429;
+  }
+
+  if (code >= 500) {
+    return code;
+  }
+
+  return 502;
+}
+
+function classifyUpstreamSseErrorType(code, message) {
+  const normalized = String(message || "").toLowerCase();
+
+  if (code === "401" || code === "402" || code === "403" || normalized.includes("unauthorized")) {
+    return "authentication_error";
+  }
+
+  if (code === "429" || normalized.includes("rate limit")) {
+    return "rate_limit_error";
+  }
+
+  if (code === "400" || normalized.includes("invalid") || normalized.includes("bad request")) {
+    return "invalid_request_error";
+  }
+
+  if (code === "408" || normalized.includes("timeout")) {
+    return "api_timeout_error";
+  }
+
+  return "api_error";
+}
+
+class UpstreamHttpError extends Error {
+  constructor(status, statusText, bodyText, token) {
+    const parsed = safeJsonParse(bodyText, null);
+    const sanitizedParsed = sanitizeErrorBody(parsed, token);
+    const sanitizedText = sanitizeErrorText(bodyText || "", token);
+    const fallbackMessage = sanitizedText || `Direct LLM upstream request failed: ${status} ${statusText}`;
+    const message = extractErrorMessage(sanitizedParsed, fallbackMessage);
+
+    super(message);
+    this.name = "UpstreamHttpError";
+    this.status = Number(status) || 500;
+    this.statusText = statusText || "";
+    this.type = extractErrorType(sanitizedParsed) || null;
+    this.bodyText = sanitizedText;
+    this.body = sanitizedParsed || sanitizedText || null;
+    this.details = {
+      upstream: {
+        status: this.status,
+        statusText: this.statusText,
+        body: this.body
+      }
+    };
+  }
+}
+
+class UpstreamSseError extends Error {
+  constructor(frame) {
+    const code = String(frame && frame.error_code ? frame.error_code : "").trim() || null;
+    const message =
+      String(frame && frame.error_message ? frame.error_message : "").trim() ||
+      "Direct LLM upstream stream returned an error frame";
+
+    super(message);
+    this.name = "UpstreamSseError";
+    this.status = mapUpstreamErrorStatus(code);
+    this.statusText = "OK";
+    this.type = classifyUpstreamSseErrorType(code, message);
+    this.code = code;
+    this.body = frame || null;
+    this.details = {
+      upstream: {
+        status: 200,
+        statusText: "OK",
+        body: frame || null
+      }
+    };
+  }
+}
+
 class DirectLlmClient {
   constructor(config) {
     this.config = config;
+    this.authProvider = config.authProvider || null;
+    this.gatewayManager = config.gatewayManager || null;
     this._cachedToken = null;
     this._cachedAt = 0;
     this._cacheTtlMs = 2 * 60 * 1000; // 2 minutes
   }
 
-  async getAuthToken() {
+  async getGatewayToken(options = {}) {
     if (this._cachedToken && Date.now() - this._cachedAt < this._cacheTtlMs) {
       return this._cachedToken;
     }
 
+    if (this.gatewayManager) {
+      const result = await this.gatewayManager.resolveAccessToken({
+        allowAutostart: options.allowAutostart !== false
+      });
+
+      this._cachedToken = result.token;
+      this._cachedAt = Date.now();
+      return result.token;
+    }
+
     const res = await fetch(`${this.config.localGatewayBaseUrl}/debug/auth/ws-status`);
     const payload = await res.json();
-    const url = payload && payload.data && payload.data.phoenix && payload.data.phoenix.url;
+    const token = extractAccessToken(payload);
 
-    if (!url) {
+    if (!token) {
       this._cachedToken = null;
       throw new Error("Unable to resolve Accio access token from local gateway");
     }
 
-    const token = new URL(url).searchParams.get("accessToken");
-
     this._cachedToken = token;
     this._cachedAt = Date.now();
     return token;
+  }
+
+  async getAuthToken(options = {}) {
+    const authMode = String(this.config.authMode || "auto");
+
+    if (this.authProvider && authMode !== "gateway") {
+      const credential = this.authProvider.resolveCredential({
+        accountId: options.accountId,
+        excludeIds: options.excludeIds
+      });
+
+      if (credential) {
+        return credential;
+      }
+
+      if (authMode === "file" || authMode === "env") {
+        throw new Error(`No usable credentials available for auth mode ${authMode}`);
+      }
+    }
+
+    return {
+      accountId: null,
+      token: await this.getGatewayToken({ allowAutostart: options.allowAutostart !== false }),
+      source: "gateway"
+    };
   }
 
   clearTokenCache() {
@@ -614,73 +821,127 @@ class DirectLlmClient {
 
   async isAvailable() {
     try {
-      return Boolean(await this.getAuthToken());
+      const auth = await this.getAuthToken({ allowAutostart: false });
+      return Boolean(auth && auth.token);
     } catch {
       return false;
     }
   }
 
   async run(request, options = {}) {
-    const token = await this.getAuthToken();
+    const explicitAccountId = options.accountId || request.accountId || null;
+    const triedAccounts = new Set();
+    let lastError = null;
 
-    if (!token) {
-      throw new Error("Accio access token is unavailable");
-    }
-
-    const upstreamBody = {
-      ...request.requestBody,
-      token
-    };
-    let res;
-
-    try {
-      res = await fetch(`${this.config.upstreamBaseUrl}/generateContent`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "text/event-stream"
-        },
-        body: JSON.stringify(upstreamBody),
-        signal: AbortSignal.timeout(this.config.requestTimeoutMs)
+    while (true) {
+      const auth = await this.getAuthToken({
+        allowAutostart: true,
+        accountId: explicitAccountId,
+        excludeIds: [...triedAccounts]
       });
-    } catch (error) {
-      // Clear cache on connection errors so next request retries auth
-      this.clearTokenCache();
-      throw error;
-    }
+      const token = auth && auth.token;
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-
-      if (res.status === 401 || res.status === 403) {
-        this.clearTokenCache();
+      if (!token) {
+        throw new Error("Accio access token is unavailable");
       }
 
-      throw new Error(
-        `Direct LLM request failed: ${res.status} ${res.statusText}${text ? ` - ${sanitizeErrorText(text, token)}` : ""}`
-      );
-    }
+      const upstreamBody = {
+        ...request.requestBody,
+        token
+      };
+      let res;
 
-    if (!res.body) {
-      throw new Error("Direct LLM response has no body");
-    }
+      try {
+        res = await fetch(`${this.config.upstreamBaseUrl}/generateContent`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "text/event-stream"
+          },
+          body: JSON.stringify(upstreamBody),
+          signal: AbortSignal.timeout(this.config.requestTimeoutMs)
+        });
+      } catch (error) {
+        if (auth.source === "gateway") {
+          this.clearTokenCache();
+        }
 
-    const state = new DirectResponseAccumulator(request.model);
-
-    for await (const frame of parseSseEvents(res.body)) {
-      if (!frame) {
-        continue;
+        throw error;
       }
 
-      state.applyFrame(frame, options.onEvent);
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        const upstreamError = new UpstreamHttpError(res.status, res.statusText, text, token);
+        const message = upstreamError.message;
+
+        if (res.status === 401 || res.status === 403) {
+          if (auth.source === "gateway") {
+            this.clearTokenCache();
+          }
+
+          if (auth.accountId && this.authProvider) {
+            this.authProvider.invalidateAccount(auth.accountId);
+          }
+
+          if (!explicitAccountId && auth.accountId) {
+            triedAccounts.add(auth.accountId);
+            lastError = upstreamError;
+            const next = this.authProvider ? this.authProvider.resolveCredential({ excludeIds: [...triedAccounts] }) : null;
+
+            if (next) {
+              continue;
+            }
+
+            if (String(this.config.authMode || "auto") === "auto" && auth.source !== "gateway") {
+              continue;
+            }
+          }
+        }
+
+        throw upstreamError;
+      }
+
+      if (!res.body) {
+        throw new Error("Direct LLM response has no body");
+      }
+
+      const state = new DirectResponseAccumulator(request.model);
+
+      for await (const frame of parseSseEvents(res.body)) {
+        if (!frame) {
+          continue;
+        }
+
+        state.applyFrame(frame, options.onEvent);
+
+        if (state.error) {
+          break;
+        }
+      }
+
+      if (state.error) {
+        if ((state.error.status === 401 || state.error.status === 403) && auth.accountId && this.authProvider) {
+          this.authProvider.invalidateAccount(auth.accountId);
+        }
+
+        throw state.error;
+      }
+
+      return {
+        ...state.toResult(),
+        accountId: auth.accountId,
+        authSource: auth.source
+      };
     }
 
-    return state.toResult();
+    throw lastError;
   }
 }
 
 module.exports = {
   DirectLlmClient,
+  UpstreamHttpError,
+  UpstreamSseError,
   buildDirectRequestFromAnthropic,
   buildDirectRequestFromOpenAi,
   mapRequestedModel

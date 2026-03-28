@@ -4,6 +4,9 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  DirectLlmClient,
+  UpstreamHttpError,
+  UpstreamSseError,
   buildDirectRequestFromAnthropic,
   buildDirectRequestFromOpenAi,
   mapRequestedModel
@@ -53,4 +56,106 @@ test("buildDirectRequestFromOpenAi maps tools into declarations", () => {
 
   assert.equal(request.requestBody.tools[0].name, "lookup_weather");
   assert.match(request.requestBody.tools[0].parameters_json, /city/);
+});
+
+test("UpstreamHttpError preserves upstream status and sanitizes token", async () => {
+  const originalFetch = global.fetch;
+  const token = "s3c2db98-secret-token";
+
+  global.fetch = async () => ({
+    ok: false,
+    status: 429,
+    statusText: "Too Many Requests",
+    async text() {
+      return JSON.stringify({
+        error: {
+          type: "rate_limit_error",
+          message: `quota exceeded for ${token}`
+        }
+      });
+    }
+  });
+
+  const client = new DirectLlmClient({
+    authMode: "env",
+    authProvider: {
+      resolveCredential() {
+        return {
+          accountId: "acct_primary",
+          token,
+          source: "env"
+        };
+      }
+    },
+    requestTimeoutMs: 1000,
+    upstreamBaseUrl: "https://example.test/api/adk/llm"
+  });
+
+  await assert.rejects(
+    () => client.run({ model: "claude-opus-4-6", requestBody: { model: "claude-opus-4-6" } }),
+    (error) => {
+      assert.ok(error instanceof UpstreamHttpError);
+      assert.equal(error.status, 429);
+      assert.equal(error.type, "rate_limit_error");
+      assert.match(error.message, /quota exceeded/);
+      assert.doesNotMatch(error.message, /secret-token/);
+      assert.equal(error.details.upstream.status, 429);
+      assert.doesNotMatch(JSON.stringify(error.details), /secret-token/);
+      return true;
+    }
+  );
+
+  global.fetch = originalFetch;
+});
+
+test("DirectLlmClient converts SSE logical errors into structured upstream errors", async () => {
+  const originalFetch = global.fetch;
+  const token = "invalid_test_token";
+
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode(
+            'data:{"turn_complete":true,"error_code":"402","error_message":"unauthorized"}\n\n'
+          )
+        );
+        controller.close();
+      }
+    })
+  });
+
+  const client = new DirectLlmClient({
+    authMode: "env",
+    authProvider: {
+      resolveCredential() {
+        return {
+          accountId: "acct_primary",
+          token,
+          source: "env"
+        };
+      },
+      invalidateAccount() {}
+    },
+    requestTimeoutMs: 1000,
+    upstreamBaseUrl: "https://example.test/api/adk/llm"
+  });
+
+  await assert.rejects(
+    () => client.run({ model: "claude-opus-4-6", requestBody: { model: "claude-opus-4-6" } }),
+    (error) => {
+      assert.ok(error instanceof UpstreamSseError);
+      assert.equal(error.status, 401);
+      assert.equal(error.type, "authentication_error");
+      assert.equal(error.message, "unauthorized");
+      assert.equal(error.details.upstream.status, 200);
+      assert.equal(error.details.upstream.body.error_code, "402");
+      return true;
+    }
+  );
+
+  global.fetch = originalFetch;
 });

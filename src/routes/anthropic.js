@@ -4,7 +4,7 @@ const crypto = require("node:crypto");
 
 const { buildErrorResponse, buildMessageResponse, estimateTokens, flattenAnthropicRequest } = require("../anthropic");
 const { buildDirectRequestFromAnthropic } = require("../direct-llm");
-const { classifyErrorType, resolveResultError } = require("../errors");
+const { classifyErrorType, resolveResultError, shouldFallbackToLocalTransport } = require("../errors");
 const { CORS_HEADERS, writeJson, writeSse } = require("../http");
 const { readJsonBody } = require("../middleware/body-parser");
 const { AnthropicStreamWriter } = require("../stream/anthropic-sse");
@@ -19,6 +19,10 @@ const { resolveSessionBinding } = require("../session-store");
 
 function generateId(prefix) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+}
+
+function requestedAccountId(headers) {
+  return headers["x-accio-account-id"] || headers["x-account-id"] || null;
 }
 
 async function runDirectAnthropic(body, req, res, directClient) {
@@ -48,6 +52,7 @@ async function runDirectAnthropic(body, req, res, directClient) {
   };
 
   const result = await directClient.run(request, {
+    accountId: requestedAccountId(req.headers),
     onEvent(event) {
       if (!stream) {
         return;
@@ -118,7 +123,8 @@ async function runDirectAnthropic(body, req, res, directClient) {
       sessionId: binding.sessionId,
       stopReason: result.stopReason,
       toolCalls,
-      toolResults: []
+      toolResults: [],
+      accountId: result.accountId
     }),
     sessionHeaders({ sessionId: binding.sessionId })
   );
@@ -132,7 +138,7 @@ async function handleMessagesRequest(req, res, client, directClient, sessionStor
       await runDirectAnthropic(body, req, res, directClient);
       return;
     } catch (error) {
-      if (client.config.transportMode === "direct-llm") {
+      if (client.config.transportMode === "direct-llm" || !shouldFallbackToLocalTransport(error)) {
         throw error;
       }
     }

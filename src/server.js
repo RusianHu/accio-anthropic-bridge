@@ -6,10 +6,12 @@ const path = require("node:path");
 const { URL } = require("node:url");
 
 const { AccioClient, HttpError } = require("./accio-client");
+const { AuthProvider } = require("./auth-provider");
 const { buildErrorResponse, flattenAnthropicRequest } = require("./anthropic");
 const { DirectLlmClient } = require("./direct-llm");
-const { discoverAccioConfig } = require("./discovery");
+const { discoverAccioAppPath, discoverAccioConfig } = require("./discovery");
 const { classifyErrorType } = require("./errors");
+const { GatewayManager, parseFlag } = require("./gateway-manager");
 const { CORS_HEADERS, writeJson } = require("./http");
 const log = require("./logger");
 const { handleAccioAuthProbe, handleHealth } = require("./routes/health");
@@ -22,7 +24,9 @@ function generateId(prefix) {
 }
 
 function env(name, fallback) {
-  return process.env[name] || fallback;
+  return Object.prototype.hasOwnProperty.call(process.env, name)
+    ? process.env[name]
+    : fallback;
 }
 
 function createConfig() {
@@ -54,6 +58,16 @@ function createConfig() {
     sourceType: env("ACCIO_SOURCE_TYPE", "im"),
     requestTimeoutMs: Number(env("ACCIO_REQUEST_TIMEOUT_MS", "120000")),
     transportMode: env("ACCIO_TRANSPORT", "auto"),
+    authMode: env("ACCIO_AUTH_MODE", "auto"),
+    authStrategy: env("ACCIO_AUTH_STRATEGY", "round_robin"),
+    accountsPath: env("ACCIO_ACCOUNTS_PATH", path.join(process.cwd(), "config", "accounts.json")),
+    accessToken: env("ACCIO_ACCESS_TOKEN", ""),
+    envAccountId: env("ACCIO_AUTH_ACCOUNT_ID", "env-default"),
+    accessTokenExpiresAt: env("ACCIO_ACCESS_TOKEN_EXPIRES_AT", ""),
+    gatewayAutostart: parseFlag(env("ACCIO_GATEWAY_AUTOSTART", "1"), true),
+    appPath: discoverAccioAppPath(env("ACCIO_APP_PATH", "")),
+    gatewayWaitMs: Number(env("ACCIO_GATEWAY_WAIT_MS", "20000")),
+    gatewayPollMs: Number(env("ACCIO_GATEWAY_POLL_MS", "500")),
     directLlmBaseUrl: env(
       "ACCIO_DIRECT_LLM_BASE_URL",
       "https://phoenix-gw.alibaba.com/api/adk/llm"
@@ -177,7 +191,13 @@ function createServer(client, directClient, sessionStore) {
       writeJson(
         res,
         statusCode,
-        buildErrorResponse(message, classifyErrorType(statusCode, error))
+        buildErrorResponse(
+          message,
+          error && typeof error.type === "string"
+            ? error.type
+            : classifyErrorType(statusCode, error),
+          error && error.details ? { details: error.details } : {}
+        )
       );
     }
   });
@@ -186,7 +206,18 @@ function createServer(client, directClient, sessionStore) {
 async function main() {
   const config = createConfig();
   const client = new AccioClient(config);
+  const authProvider = new AuthProvider(config);
+  const gatewayManager = new GatewayManager({
+    baseUrl: config.baseUrl,
+    appPath: config.appPath,
+    autostartEnabled: config.gatewayAutostart,
+    waitMs: config.gatewayWaitMs,
+    pollMs: config.gatewayPollMs
+  });
   const directClient = new DirectLlmClient({
+    authMode: config.authMode,
+    authProvider,
+    gatewayManager,
     localGatewayBaseUrl: config.baseUrl,
     requestTimeoutMs: config.requestTimeoutMs,
     upstreamBaseUrl: config.directLlmBaseUrl

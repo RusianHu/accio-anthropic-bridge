@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
+const { resolveResultError } = require("../src/errors");
 const { parseJsonc, stripJsonComments } = require("../src/jsonc");
 const { resolveSessionBinding } = require("../src/session-store");
 
@@ -38,4 +39,16 @@ test("resolveSessionBinding honors headers then metadata then body", () => {
     conversationId: null,
     sessionId: "user_3"
   });
+});
+
+test("resolveResultError extracts structured message from JSON string payload", () => {
+  const result = resolveResultError({
+    finalMessage: { metadata: { errorCode: "429" } },
+    channelResponse: {
+      content: '{"turn_complete":true,"error_code":"429","error_message":"quota exhausted"}'
+    }
+  });
+
+  assert.equal(result.errorCode, 429);
+  assert.equal(result.errorMessage, "quota exhausted");
 });

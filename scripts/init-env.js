@@ -8,6 +8,7 @@ const path = require("node:path");
 const { URL } = require("node:url");
 
 const {
+  discoverAccioAppPath,
   discoverAccioConfig,
   discoverSessionSource,
   exists
@@ -93,6 +94,16 @@ function buildEnvFile(config) {
     `ACCIO_SOURCE_TYPE=${quoteEnvValue(config.sourceType)}`,
     `ACCIO_REQUEST_TIMEOUT_MS=${quoteEnvValue(config.requestTimeoutMs)}`,
     `ACCIO_TRANSPORT=${quoteEnvValue(config.transportMode)}`,
+    `ACCIO_AUTH_MODE=${quoteEnvValue(config.authMode)}`,
+    `ACCIO_AUTH_STRATEGY=${quoteEnvValue(config.authStrategy)}`,
+    `ACCIO_ACCOUNTS_PATH=${quoteEnvValue(config.accountsPath)}`,
+    `ACCIO_ACCESS_TOKEN=${quoteEnvValue(config.accessToken)}`,
+    `ACCIO_AUTH_ACCOUNT_ID=${quoteEnvValue(config.envAccountId)}`,
+    `ACCIO_ACCESS_TOKEN_EXPIRES_AT=${quoteEnvValue(config.accessTokenExpiresAt)}`,
+    `ACCIO_GATEWAY_AUTOSTART=${quoteEnvValue(config.gatewayAutostart)}`,
+    `ACCIO_APP_PATH=${quoteEnvValue(config.appPath)}`,
+    `ACCIO_GATEWAY_WAIT_MS=${quoteEnvValue(config.gatewayWaitMs)}`,
+    `ACCIO_GATEWAY_POLL_MS=${quoteEnvValue(config.gatewayPollMs)}`,
     `ACCIO_DIRECT_LLM_BASE_URL=${quoteEnvValue(config.directLlmBaseUrl)}`,
     `ACCIO_CLIENT_ID_PREFIX=${quoteEnvValue(config.clientIdPrefix)}`,
     `ACCIO_SESSION_STORE_PATH=${quoteEnvValue(config.sessionStorePath)}`,
@@ -168,6 +179,18 @@ async function main() {
     sourceType: process.env.ACCIO_SOURCE_TYPE || "im",
     requestTimeoutMs: process.env.ACCIO_REQUEST_TIMEOUT_MS || "120000",
     transportMode: process.env.ACCIO_TRANSPORT || "auto",
+    authMode: process.env.ACCIO_AUTH_MODE || "auto",
+    authStrategy: process.env.ACCIO_AUTH_STRATEGY || "round_robin",
+    accountsPath:
+      process.env.ACCIO_ACCOUNTS_PATH ||
+      path.join(REPO_ROOT, "config", "accounts.json"),
+    accessToken: process.env.ACCIO_ACCESS_TOKEN || "",
+    envAccountId: process.env.ACCIO_AUTH_ACCOUNT_ID || "env-default",
+    accessTokenExpiresAt: process.env.ACCIO_ACCESS_TOKEN_EXPIRES_AT || "",
+    gatewayAutostart: process.env.ACCIO_GATEWAY_AUTOSTART || "1",
+    appPath: discoverAccioAppPath(process.env.ACCIO_APP_PATH || ""),
+    gatewayWaitMs: process.env.ACCIO_GATEWAY_WAIT_MS || "20000",
+    gatewayPollMs: process.env.ACCIO_GATEWAY_POLL_MS || "500",
     directLlmBaseUrl:
       process.env.ACCIO_DIRECT_LLM_BASE_URL ||
       "https://phoenix-gw.alibaba.com/api/adk/llm",

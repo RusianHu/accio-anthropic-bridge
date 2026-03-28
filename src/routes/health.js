@@ -51,10 +51,14 @@ async function handleHealth(req, res, client, directClient, sessionStore) {
     auth,
     authDebug,
     directLlm,
+    authProvider: directClient.authProvider ? directClient.authProvider.getSummary() : null,
+    gatewayManager: directClient.gatewayManager ? directClient.gatewayManager.getSummary() : null,
     config: {
       baseUrl: client.config.baseUrl,
       directLlmBaseUrl: client.config.directLlmBaseUrl,
       agentId: client.config.agentId,
+      authMode: client.config.authMode,
+      gatewayAutostart: client.config.gatewayAutostart,
       transportMode: client.config.transportMode,
       workspacePath: client.config.workspacePath,
       port: client.config.port
@@ -147,6 +151,7 @@ async function handleAccioAuthProbe(req, res, client, directClient) {
       hasCookie,
       hasTokenPrefix,
       rawCredentialsExposedOverHttp: true,
+      authMode: client.config.authMode,
       directAuthReuseFeasible: directLlmAvailable,
       note: directLlmAvailable
         ? "Local debug endpoints expose enough auth-bearing data to reuse the desktop login for direct /api/adk/llm calls."
