@@ -15,6 +15,15 @@ const log = require("./logger");
 const { ModelsRegistry } = require("./models");
 const { ResponseCache } = require("./response-cache");
 const { handleTraceDetail, handleTraceReplay, handleTracesList } = require("./routes/debug");
+const {
+  handleAdminPage,
+  handleAdminState,
+  handleAdminSnapshotCreate,
+  handleAdminSnapshotActivate,
+  handleAdminGatewayLogin,
+  handleAdminGatewayLogout,
+  handleAdminCaptureAccount
+} = require("./routes/admin");
 const { handleAccioAuthProbe, handleHealth } = require("./routes/health");
 const { handleCountTokens, handleMessagesRequest } = require("./routes/anthropic");
 const { handleChatCompletionsRequest, handleModelsRequest, handleResponsesRequest } = require("./routes/openai");
@@ -49,7 +58,7 @@ function captureTrace(traceStore, req, res, requestMeta, startedAt) {
   });
 }
 
-function createServer(client, directClient, sessionStore, modelsRegistry, responseCache, traceStore) {
+function createServer(config, client, directClient, authProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore) {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const startTime = Date.now();
@@ -100,6 +109,13 @@ function createServer(client, directClient, sessionStore, modelsRegistry, respon
           name: "accio-anthropic-bridge",
           ok: true,
           endpoints: [
+            "GET /admin",
+            "GET /admin/api/state",
+            "POST /admin/api/snapshots",
+            "POST /admin/api/snapshots/activate",
+            "POST /admin/api/gateway/login",
+            "POST /admin/api/gateway/logout",
+            "POST /admin/api/accounts/capture",
             "GET /healthz",
             "GET /debug/accio-auth",
             "GET /debug/traces",
@@ -113,6 +129,48 @@ function createServer(client, directClient, sessionStore, modelsRegistry, respon
           ]
         });
         finishLog("info", "request completed", { status: 200 });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/admin") {
+        await handleAdminPage(req, res, config);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-ui" });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/admin/api/state") {
+        await handleAdminState(req, res, config, authProvider);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/snapshots") {
+        await handleAdminSnapshotCreate(req, res, config);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/snapshots/activate") {
+        await handleAdminSnapshotActivate(req, res, config);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/gateway/login") {
+        await handleAdminGatewayLogin(req, res, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/gateway/logout") {
+        await handleAdminGatewayLogout(req, res, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/accounts/capture") {
+        await handleAdminCaptureAccount(req, res, config, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
         return;
       }
 
@@ -266,7 +324,7 @@ async function main() {
     maxStringLength: config.traceMaxBodyChars,
     sampleRate: config.traceSampleRate
   });
-  const server = createServer(client, directClient, sessionStore, modelsRegistry, responseCache, traceStore);
+  const server = createServer(config, client, directClient, authProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore);
 
   let shuttingDown = false;
 

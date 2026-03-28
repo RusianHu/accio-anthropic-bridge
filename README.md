@@ -415,11 +415,57 @@ npm run capture-token -- --write-file --account-id acct_primary
 
 这个命令会读取 `.env`，在需要时自动拉起 Accio，抓到 token 后写入 `ACCIO_ACCOUNTS_CONFIG_PATH`。当前 bridge 默认不会主动关闭 Accio。
 
+如果你想在重新登录后一次性完成“写入账号池 + 保存本机登录态快照”，可以直接：
+
+```bash
+npm run auth:relogin -- --write-file --account-id acct_primary --snapshot-alias acct_primary
+```
+
+如果你想把 Accio 桌面端当前登录态按账号做本机快照，并在之后恢复为某个已保存账号，可以使用：
+
+```bash
+npm run auth:state -- status
+npm run auth:state -- snapshot acct_a
+npm run auth:state -- list
+npm run auth:state -- activate acct_a
+```
+
+这组命令会优先处理 Accio 主进程使用的加密登录态文件：
+
+- macOS 默认是 `~/Library/Application Support/Accio/credentials.enc`
+- 明文回退路径是 `~/.config/accio/credentials.json`
+
+注意几点：
+
+- 这不是跨机器通用 token 导出，而是“当前机器上的 Accio 登录态文件快照”
+- `credentials.enc` 由 Electron `safeStorage` 加密，通常只适用于同一台机器、同一系统用户
+- 如果本地 `4097` 网关还在运行，它可能仍持有旧的内存登录态；`activate` 只会恢复磁盘状态，生效前通常需要重启 Accio 或本地网关
+
 默认监听：
 
 ```text
 http://127.0.0.1:8082
 ```
+
+本地管理台：
+
+```text
+http://127.0.0.1:8082/admin
+```
+
+如果服务已经启动，也可以直接执行：
+
+```bash
+npm run manager:open
+```
+
+管理台当前支持：
+
+- 查看当前 Accio 登录状态和当前用户
+- 查看本机登录态落盘位置
+- 保存和激活本机快照
+- 发起网页登录 / 执行登出
+- 把当前 token 写回账号池文件
 
 ## 本地鉴权探测
 

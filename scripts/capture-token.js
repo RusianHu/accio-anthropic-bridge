@@ -6,6 +6,7 @@ const path = require("node:path");
 const { loadEnvFile } = require("../src/env-file");
 const { GatewayManager } = require("../src/gateway-manager");
 const { discoverAccioAppPath } = require("../src/discovery");
+const { writeAccountToFile } = require("../src/accounts-file");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 
@@ -42,48 +43,8 @@ function maskToken(token) {
   return token.length > 8 ? `${token.slice(0, 8)}***` : "***";
 }
 
-function loadAccountsFile(filePath) {
-  try {
-    const text = fs.readFileSync(filePath, "utf8");
-    const parsed = JSON.parse(text);
-
-    if (Array.isArray(parsed)) {
-      return { strategy: "round_robin", accounts: parsed };
-    }
-
-    return {
-      strategy: parsed && parsed.strategy ? parsed.strategy : "round_robin",
-      accounts: parsed && Array.isArray(parsed.accounts) ? parsed.accounts : []
-    };
-  } catch (error) {
-    if (error && error.code === "ENOENT") {
-      return { strategy: "round_robin", accounts: [] };
-    }
-
-    throw error;
-  }
-}
-
-function writeAccountToFile(filePath, accountId, accessToken) {
-  const state = loadAccountsFile(filePath);
-  const accounts = state.accounts.filter((account) => String(account.id || account.accountId) !== accountId);
-
-  accounts.push({
-    id: accountId,
-    accessToken,
-    enabled: true,
-    source: "gateway-capture"
-  });
-
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(
-    filePath,
-    JSON.stringify({ strategy: state.strategy, accounts }, null, 2) + "\n",
-    "utf8"
-  );
-}
-
 async function main() {
+
   const args = parseArgs(process.argv.slice(2));
   const accountsPath = path.resolve(env("ACCIO_ACCOUNTS_CONFIG_PATH", env("ACCIO_ACCOUNTS_PATH", path.join(REPO_ROOT, "config", "accounts.json"))));
   const manager = new GatewayManager({
