@@ -2,22 +2,16 @@
 
 const crypto = require("node:crypto");
 
+const modelAliases = require("../config/model-aliases.json");
+
+const { normalizeRequestedModel } = require("./model");
+
 function safeJsonParse(value, fallback = null) {
   try {
     return JSON.parse(value);
   } catch {
     return fallback;
   }
-}
-
-function normalizeRequestedModel(model) {
-  const value = String(model || "").trim();
-
-  if (!value || ["accio-bridge", "auto", "default"].includes(value)) {
-    return null;
-  }
-
-  return value;
 }
 
 function mapRequestedModel(model, protocol) {
@@ -28,30 +22,7 @@ function mapRequestedModel(model, protocol) {
     return fallback;
   }
 
-  const aliasMap = {
-    "claude-opus-4-6": "claude-opus-4-6",
-    "claude-opus-4-5": "claude-opus-4-6",
-    "claude-opus-4-1": "claude-opus-4-6",
-    "claude-sonnet-4-6": "claude-sonnet-4-6",
-    "claude-sonnet-4-5": "claude-sonnet-4-6",
-    "claude-3-7-sonnet-latest": "claude-sonnet-4-6",
-    "claude-haiku-4-5": "claude-haiku-4-5",
-    "gpt-5.1": "claude-opus-4-6",
-    "gpt-5.1-1113": "claude-opus-4-6",
-    "gpt-5": "claude-opus-4-6",
-    "gpt-5-0807": "claude-opus-4-6",
-    "gpt-5-mini": "claude-opus-4-6",
-    "gpt-5-mini-0807": "claude-opus-4-6",
-    "gpt-4.1": "claude-opus-4-6",
-    "gpt-4.1-0414": "claude-opus-4-6",
-    "gpt-4.1-mini": "claude-opus-4-6",
-    "gpt-4.1-mini-0414": "claude-opus-4-6",
-    "gpt-4o": "claude-opus-4-6",
-    "gemini-3-flash-preview": "gemini-3-flash-preview",
-    "gemini-3-pro-preview": "gemini-3-pro-preview"
-  };
-
-  return aliasMap[requested] || requested;
+  return modelAliases[requested] || requested;
 }
 
 function inferProvider(model) {
@@ -534,7 +505,7 @@ class DirectResponseAccumulator {
 
   toResult() {
     return {
-      id: this.id || `msg_${Date.now()}`,
+      id: this.id || `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
       model: this.model,
       finalText: this.text,
       toolCalls: this.toolCalls,
@@ -591,21 +562,54 @@ async function* parseSseEvents(stream) {
   }
 }
 
+function maskToken(token) {
+  if (!token || typeof token !== "string") {
+    return "***";
+  }
+
+  return token.length > 8 ? `${token.slice(0, 8)}***` : "***";
+}
+
+function sanitizeErrorText(text, token) {
+  if (!text || !token) {
+    return text || "";
+  }
+
+  return text.replace(new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), maskToken(token));
+}
+
 class DirectLlmClient {
   constructor(config) {
     this.config = config;
+    this._cachedToken = null;
+    this._cachedAt = 0;
+    this._cacheTtlMs = 2 * 60 * 1000; // 2 minutes
   }
 
   async getAuthToken() {
+    if (this._cachedToken && Date.now() - this._cachedAt < this._cacheTtlMs) {
+      return this._cachedToken;
+    }
+
     const res = await fetch(`${this.config.localGatewayBaseUrl}/debug/auth/ws-status`);
     const payload = await res.json();
     const url = payload && payload.data && payload.data.phoenix && payload.data.phoenix.url;
 
     if (!url) {
+      this._cachedToken = null;
       throw new Error("Unable to resolve Accio access token from local gateway");
     }
 
-    return new URL(url).searchParams.get("accessToken");
+    const token = new URL(url).searchParams.get("accessToken");
+
+    this._cachedToken = token;
+    this._cachedAt = Date.now();
+    return token;
+  }
+
+  clearTokenCache() {
+    this._cachedToken = null;
+    this._cachedAt = 0;
   }
 
   async isAvailable() {
@@ -627,20 +631,33 @@ class DirectLlmClient {
       ...request.requestBody,
       token
     };
-    const res = await fetch(`${this.config.upstreamBaseUrl}/generateContent`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "text/event-stream"
-      },
-      body: JSON.stringify(upstreamBody),
-      signal: AbortSignal.timeout(this.config.requestTimeoutMs)
-    });
+    let res;
+
+    try {
+      res = await fetch(`${this.config.upstreamBaseUrl}/generateContent`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "text/event-stream"
+        },
+        body: JSON.stringify(upstreamBody),
+        signal: AbortSignal.timeout(this.config.requestTimeoutMs)
+      });
+    } catch (error) {
+      // Clear cache on connection errors so next request retries auth
+      this.clearTokenCache();
+      throw error;
+    }
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
+
+      if (res.status === 401 || res.status === 403) {
+        this.clearTokenCache();
+      }
+
       throw new Error(
-        `Direct LLM request failed: ${res.status} ${res.statusText}${text ? ` - ${text}` : ""}`
+        `Direct LLM request failed: ${res.status} ${res.statusText}${text ? ` - ${sanitizeErrorText(text, token)}` : ""}`
       );
     }
 
@@ -665,5 +682,6 @@ class DirectLlmClient {
 module.exports = {
   DirectLlmClient,
   buildDirectRequestFromAnthropic,
-  buildDirectRequestFromOpenAi
+  buildDirectRequestFromOpenAi,
+  mapRequestedModel
 };

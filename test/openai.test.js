@@ -1,0 +1,69 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+
+const {
+  buildChatCompletionChunk,
+  buildChatCompletionResponse,
+  buildOpenAiModelsResponse,
+  flattenOpenAiRequest
+} = require("../src/openai");
+
+test("flattenOpenAiRequest includes tools and tool calls", () => {
+  const flattened = flattenOpenAiRequest({
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "lookup_weather",
+          description: "Look up weather",
+          parameters: { type: "object" }
+        }
+      }
+    ],
+    messages: [
+      { role: "user", content: "hello" },
+      {
+        role: "assistant",
+        tool_calls: [
+          {
+            id: "call_1",
+            function: { name: "lookup_weather", arguments: "{\"city\":\"Hangzhou\"}" }
+          }
+        ]
+      }
+    ]
+  });
+
+  assert.match(flattened, /Available tools:/);
+  assert.match(flattened, /Assistant requested tool lookup_weather id=call_1/);
+});
+
+test("buildChatCompletionResponse maps tool calls", () => {
+  const response = buildChatCompletionResponse(
+    { model: "accio-bridge" },
+    "",
+    {
+      inputTokens: 11,
+      outputTokens: 7,
+      toolCalls: [{ id: "call_1", name: "lookup_weather", input: { city: "Hangzhou" } }]
+    }
+  );
+
+  assert.equal(response.choices[0].finish_reason, "tool_calls");
+  assert.equal(response.choices[0].message.tool_calls[0].function.name, "lookup_weather");
+});
+
+test("buildChatCompletionChunk and model listing stay OpenAI-compatible", () => {
+  const chunk = buildChatCompletionChunk(
+    { model: "accio-bridge" },
+    { role: "assistant", content: "OK" },
+    { finishReason: null }
+  );
+  const models = buildOpenAiModelsResponse();
+
+  assert.equal(chunk.object, "chat.completion.chunk");
+  assert.equal(models.object, "list");
+  assert.equal(models.data[0].id, "accio-bridge");
+});

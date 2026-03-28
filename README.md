@@ -17,6 +17,9 @@
 - 更细的错误分类和本地重试
 - 自动发现可用的 Accio `agent/source/workspace`
 - 本地 Accio 鉴权复用探测
+- 一键环境初始化与 `.env` 自动加载
+- 请求级结构化日志
+- Node.js 内置测试覆盖
 
 ## 免责申明
 
@@ -166,6 +169,8 @@ Accio 桌面端本地暴露了两类入口：
 
 ```text
 accio-anthropic-bridge/
+  config/
+    model-aliases.json
   .env.example
   .gitignore
   package.json
@@ -174,12 +179,27 @@ accio-anthropic-bridge/
   src/
     accio-client.js
     anthropic.js
+    bridge-core.js
     direct-llm.js
     discovery.js
+    errors.js
+    http.js
     jsonc.js
+    logger.js
+    middleware/
+      body-parser.js
+    routes/
+      anthropic.js
+      health.js
+      openai.js
+    stream/
+      anthropic-sse.js
+      openai-sse.js
     openai.js
     server.js
     session-store.js
+  test/
+    *.test.js
 ```
 
 ## 启动
@@ -222,6 +242,12 @@ npm run init-env -- --force
 ```bash
 ACCIO_TRANSPORT=auto
 ACCIO_DIRECT_LLM_BASE_URL=https://phoenix-gw.alibaba.com/api/adk/llm
+```
+
+如果你要调整模型别名映射，不需要改代码，直接编辑：
+
+```text
+config/model-aliases.json
 ```
 
 默认监听：
@@ -393,16 +419,63 @@ claude
 
 这里的 `ANTHROPIC_API_KEY` 只是为了满足某些客户端的本地校验。代理本身不校验这个值。
 
+## 测试
+
+项目现在带了零依赖单测，可以直接跑：
+
+```bash
+npm test
+```
+
+当前测试覆盖的主要是纯转换逻辑：
+
+- Anthropic 请求压平和响应映射
+- OpenAI 请求压平和响应映射
+- Direct LLM 请求构造
+- JSONC 解析
+- Session 绑定规则
+
+## 日志
+
+桥接现在默认输出 JSON 结构化日志，包含：
+
+- `ts`
+- `level`
+- `msg`
+- `requestId`
+- `method`
+- `path`
+- `status`
+- `ms`
+
+可以通过下面的环境变量调低或调高日志级别：
+
+```bash
+LOG_LEVEL=debug
+```
+
 ## 关键实现文件
 
 - [src/server.js](/Users/snow/accio-anthropic-bridge/src/server.js)
-  HTTP 路由、Anthropic/OpenAI 兼容层、错误分类、SSE 输出
+  服务器装配、路由注册、生命周期管理
+- [src/routes/anthropic.js](/Users/snow/accio-anthropic-bridge/src/routes/anthropic.js)
+  Anthropic Messages 路由与 direct/local-ws 执行链路
+- [src/routes/openai.js](/Users/snow/accio-anthropic-bridge/src/routes/openai.js)
+  OpenAI Chat Completions 路由与 direct/local-ws 执行链路
+- [src/routes/health.js](/Users/snow/accio-anthropic-bridge/src/routes/health.js)
+  健康检查与本地鉴权探测
+- [src/stream/anthropic-sse.js](/Users/snow/accio-anthropic-bridge/src/stream/anthropic-sse.js)
+  Anthropic SSE writer
+- [src/stream/openai-sse.js](/Users/snow/accio-anthropic-bridge/src/stream/openai-sse.js)
+  OpenAI SSE writer
 - [src/accio-client.js](/Users/snow/accio-anthropic-bridge/src/accio-client.js)
   Accio HTTP/WS 客户端、重试、conversation 回读、tool artifacts 收集
 - [src/discovery.js](/Users/snow/accio-anthropic-bridge/src/discovery.js)
   本地 `~/.accio` 自动发现
 - [src/session-store.js](/Users/snow/accio-anthropic-bridge/src/session-store.js)
   session 到 conversation 的持久化映射
+- [config/model-aliases.json](/Users/snow/accio-anthropic-bridge/config/model-aliases.json)
+  可编辑的模型别名映射
 - [src/anthropic.js](/Users/snow/accio-anthropic-bridge/src/anthropic.js)
   Anthropic 请求压平和响应映射
 - [src/openai.js](/Users/snow/accio-anthropic-bridge/src/openai.js)

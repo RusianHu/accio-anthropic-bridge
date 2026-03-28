@@ -1,6 +1,12 @@
 "use strict";
 
+const crypto = require("node:crypto");
+
 const { normalizeContent } = require("./anthropic");
+
+function generateId(prefix) {
+  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+}
 
 function normalizeToolDefinitions(tools) {
   if (!Array.isArray(tools)) {
@@ -99,7 +105,7 @@ function buildChatCompletionResponse(body, text, extras = {}) {
   const hasToolCalls = toolCalls.length > 0;
 
   return {
-    id: extras.id || `chatcmpl_${Date.now()}`,
+    id: extras.id || generateId("chatcmpl"),
     object: "chat.completion",
     created: extras.created || Math.floor(Date.now() / 1000),
     model: body.model || "accio-bridge",
@@ -129,7 +135,7 @@ function buildChatCompletionResponse(body, text, extras = {}) {
 
 function buildChatCompletionChunk(body, delta, extras = {}) {
   return {
-    id: extras.id || `chatcmpl_${Date.now()}`,
+    id: extras.id || generateId("chatcmpl"),
     object: "chat.completion.chunk",
     created: extras.created || Math.floor(Date.now() / 1000),
     model: body.model || "accio-bridge",

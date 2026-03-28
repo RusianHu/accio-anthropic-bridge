@@ -141,6 +141,10 @@ function discoverSessionCandidates(accountDir, preferredAgentId) {
   return candidates.sort((left, right) => right.updatedAt - left.updatedAt);
 }
 
+function discoverSessionSource(accountDir, preferredAgentId) {
+  return discoverSessionCandidates(accountDir, preferredAgentId)[0] || null;
+}
+
 function discoverConversationActivity(accountDir) {
   const sessionIndex = readJsonIfExists(path.join(accountDir, "conversations", "dm", "session_1.json"));
 
@@ -418,5 +422,12 @@ function discoverAccioConfig(overrides = {}) {
 }
 
 module.exports = {
-  discoverAccioConfig
+  discoverAccioConfig,
+  discoverSessionCandidates,
+  discoverSessionSource,
+  exists,
+  listDirectories,
+  parseSessionKey,
+  readJsonIfExists,
+  resolveAccioHome
 };

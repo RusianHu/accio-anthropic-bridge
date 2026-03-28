@@ -7,8 +7,11 @@ const os = require("node:os");
 const path = require("node:path");
 const { URL } = require("node:url");
 
-const { discoverAccioConfig } = require("../src/discovery");
-const { readJsonFile } = require("../src/jsonc");
+const {
+  discoverAccioConfig,
+  discoverSessionSource,
+  exists
+} = require("../src/discovery");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const ENV_PATH = path.join(REPO_ROOT, ".env");
@@ -18,27 +21,6 @@ function parseArgs(argv) {
     force: argv.includes("--force"),
     print: argv.includes("--print")
   };
-}
-
-function exists(filePath) {
-  try {
-    fs.accessSync(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function readJsonIfExists(filePath, options = {}) {
-  try {
-    if (!exists(filePath)) {
-      return null;
-    }
-
-    return readJsonFile(filePath, options);
-  } catch {
-    return null;
-  }
 }
 
 function requestJson(urlString) {
@@ -85,87 +67,6 @@ async function getCurrentAuthUserId(baseUrl) {
   } catch {
     return null;
   }
-}
-
-function listDirectories(root) {
-  try {
-    return fs
-      .readdirSync(root, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => entry.name);
-  } catch {
-    return [];
-  }
-}
-
-function parseSessionKey(sessionKey) {
-  if (!sessionKey || typeof sessionKey !== "string") {
-    return null;
-  }
-
-  const marker = ":cid:";
-  const markerIndex = sessionKey.lastIndexOf(marker);
-
-  if (markerIndex <= 0) {
-    return null;
-  }
-
-  const prefix = sessionKey.slice(0, markerIndex);
-  const conversationId = sessionKey.slice(markerIndex + marker.length) || null;
-  const parts = prefix.split(":");
-
-  if (parts.length < 5 || parts[0] !== "agent") {
-    return null;
-  }
-
-  return {
-    agentId: parts[1] || null,
-    channelId: parts[2] || null,
-    chatType: parts[3] || null,
-    chatId: parts.slice(4).join(":") || null,
-    conversationId
-  };
-}
-
-function discoverSessionSource(accountDir, preferredAgentId) {
-  const agentsRoot = path.join(accountDir, "agents");
-  const agentIds = preferredAgentId
-    ? [preferredAgentId, ...listDirectories(agentsRoot).filter((id) => id !== preferredAgentId)]
-    : listDirectories(agentsRoot);
-
-  const candidates = [];
-
-  for (const agentId of agentIds) {
-    const sessionsDir = path.join(agentsRoot, agentId, "sessions");
-    let files = [];
-
-    try {
-      files = fs
-        .readdirSync(sessionsDir)
-        .filter((name) => name.endsWith(".meta.jsonc"))
-        .map((name) => path.join(sessionsDir, name));
-    } catch {
-      continue;
-    }
-
-    for (const filePath of files) {
-      const meta = readJsonIfExists(filePath, { jsonc: true });
-      const parsed = parseSessionKey(meta && meta.sessionId);
-
-      if (!parsed || !parsed.channelId || !parsed.chatId) {
-        continue;
-      }
-
-      candidates.push({
-        ...parsed,
-        agentId: parsed.agentId || agentId,
-        updatedAt: Date.parse((meta && meta.updatedAt) || "") || 0
-      });
-    }
-  }
-
-  candidates.sort((left, right) => right.updatedAt - left.updatedAt);
-  return candidates[0] || null;
 }
 
 function quoteEnvValue(value) {

@@ -2,7 +2,11 @@
 
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const path = require("node:path");
+
+const log = require("./logger");
+const { normalizeRequestedModel } = require("./model");
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -20,20 +24,6 @@ class HttpError extends Error {
 class AccioClient {
   constructor(config) {
     this.config = config;
-  }
-
-  normalizeRequestedModel(model) {
-    const value = String(model || "").trim();
-
-    if (!value) {
-      return null;
-    }
-
-    if (["accio-bridge", "auto", "default"].includes(value)) {
-      return null;
-    }
-
-    return value;
   }
 
   isRetriableError(error) {
@@ -105,7 +95,7 @@ class AccioClient {
     );
   }
 
-  getConversationLogDirectories() {
+  async getConversationLogDirectories() {
     const directories = [];
     const primary = this.getConversationLogDirectory();
 
@@ -115,8 +105,8 @@ class AccioClient {
 
     try {
       const accountsRoot = path.join(this.config.accioHome, "accounts");
-      const accountIds = fs
-        .readdirSync(accountsRoot, { withFileTypes: true })
+      const entries = await fsp.readdir(accountsRoot, { withFileTypes: true });
+      const accountIds = entries
         .filter((entry) => entry.isDirectory() && entry.name !== "guest")
         .map((entry) => entry.name);
 
@@ -132,18 +122,23 @@ class AccioClient {
           directories.push(directory);
         }
       }
-    } catch {}
+    } catch (error) {
+      log.debug("conversation log directory scan failed", {
+        accountsRoot: path.join(this.config.accioHome, "accounts"),
+        error: error && error.message ? error.message : String(error)
+      });
+    }
 
     return directories;
   }
 
-  readConversationMessages(conversationId) {
+  async readConversationMessages(conversationId) {
     const messages = [];
 
-    for (const directory of this.getConversationLogDirectories()) {
+    for (const directory of await this.getConversationLogDirectories()) {
       try {
-        const files = fs
-          .readdirSync(directory)
+        const allFiles = await fsp.readdir(directory);
+        const files = allFiles
           .filter(
             (file) =>
               file.startsWith(`${conversationId}.message_`) && file.endsWith(".jsonl")
@@ -152,7 +147,8 @@ class AccioClient {
 
         for (const file of files) {
           const filePath = path.join(directory, file);
-          const lines = fs.readFileSync(filePath, "utf8").split("\n");
+          const content = await fsp.readFile(filePath, "utf8");
+          const lines = content.split("\n");
 
           for (const line of lines) {
             const trimmed = line.trim();
@@ -163,16 +159,28 @@ class AccioClient {
 
             try {
               messages.push(JSON.parse(trimmed));
-            } catch {}
+            } catch (error) {
+              log.debug("conversation message parse failed", {
+                conversationId,
+                filePath,
+                error: error && error.message ? error.message : String(error)
+              });
+            }
           }
         }
-      } catch {}
+      } catch (error) {
+        log.debug("conversation log read failed", {
+          conversationId,
+          directory,
+          error: error && error.message ? error.message : String(error)
+        });
+      }
     }
 
     return messages;
   }
 
-  collectConversationArtifacts(conversationId) {
+  async collectConversationArtifacts(conversationId) {
     if (!conversationId) {
       return {
         messageId: null,
@@ -181,7 +189,7 @@ class AccioClient {
       };
     }
 
-    const messages = this.readConversationMessages(conversationId);
+    const messages = await this.readConversationMessages(conversationId);
     const lastRequestIndex = [...messages]
       .map((message, index) => ({ index, message }))
       .filter((entry) => entry.message && entry.message.role === "req")
@@ -221,7 +229,7 @@ class AccioClient {
 
         seenToolCalls.add(toolCall.id);
         toolCalls.push({
-          id: toolCall.id || `tool_${Date.now()}`,
+          id: toolCall.id || `tool_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`,
           name: toolCall.name,
           input: toolCall.arguments || toolCall.input || {}
         });
@@ -255,7 +263,7 @@ class AccioClient {
   }
 
   buildSendQueryPayload(input) {
-    const requestedModel = this.normalizeRequestedModel(input.model);
+    const requestedModel = normalizeRequestedModel(input.model);
 
     return {
       type: "req",
@@ -323,7 +331,11 @@ class AccioClient {
 
         try {
           ws.close();
-        } catch {}
+        } catch (error) {
+          log.debug("websocket close failed", {
+            error: error && error.message ? error.message : String(error)
+          });
+        }
       };
 
       const finalize = (error, result) => {
@@ -497,7 +509,7 @@ class AccioClient {
         return {
           ...result,
           conversationId,
-          ...this.collectConversationArtifacts(conversationId)
+          ...(await this.collectConversationArtifacts(conversationId))
         };
       } catch (error) {
         lastError = error;

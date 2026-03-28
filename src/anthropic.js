@@ -1,5 +1,11 @@
 "use strict";
 
+const crypto = require("node:crypto");
+
+function generateId(prefix) {
+  return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+}
+
 function normalizeSystemPrompt(system) {
   if (typeof system === "string") {
     return system;
@@ -121,7 +127,16 @@ function estimateTokens(text) {
     return 0;
   }
 
-  return Math.max(1, Math.ceil(String(text).length / 4));
+  const str = String(text);
+  let tokens = 0;
+
+  for (const char of str) {
+    // CJK and other multibyte characters ≈ 1.5 tokens on average;
+    // ASCII characters ≈ 0.25 tokens (roughly 4 chars per token).
+    tokens += char.charCodeAt(0) > 0x7f ? 1.5 : 0.25;
+  }
+
+  return Math.max(1, Math.ceil(tokens));
 }
 
 function buildMessageResponse(body, text, extras = {}) {
@@ -145,7 +160,7 @@ function buildMessageResponse(body, text, extras = {}) {
   }
 
   return {
-    id: extras.id || `msg_${Date.now()}`,
+    id: extras.id || generateId("msg"),
     type: "message",
     role: "assistant",
     model: body.model || "accio-bridge",
@@ -184,7 +199,7 @@ function normalizeAccioToolCalls(toolCalls) {
       }
 
       return {
-        id: toolCall.id || `tool_${Date.now()}`,
+        id: toolCall.id || generateId("tool"),
         name: toolCall.name,
         input:
           toolCall.input ||
