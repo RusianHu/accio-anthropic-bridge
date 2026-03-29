@@ -109,7 +109,8 @@ npm run desktop:start
 - OpenAI 兼容接口是"OpenAI 协议适配 + Claude 上游执行"
 - `/v1/responses` 未补齐 reasoning item 等完整事件语义
 - 图片 block 只做 URL / base64 级别最小映射
-- thinking 只在 `direct-llm` 路径下透传
+- Anthropic `thinking` 目前仅在 `direct-llm` 路径受理，`local-ws` 路径仍不支持
+- 上游是否正式、稳定支持 reasoning 字段目前未知；以下仅是当前环境下的实测观察，不构成官方能力声明：Gemini 在 `include_thoughts + thinking_level` 下可观察到 `thoughtSignature` / `thoughtsTokenCount`；GPT 目前只观察到 `reasoning_tokens` 统计；Claude 目前未确认存在可见 thinking 输出
 - 响应缓存只覆盖低风险纯文本请求
 
 ## 认证与账号管理
