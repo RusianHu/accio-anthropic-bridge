@@ -422,10 +422,10 @@ async function ensureBridgeReady() {
 
 function createMainWindow() {
   mainWindow = new BrowserWindow({
-    width: 1320,
-    height: 920,
-    minWidth: 1080,
-    minHeight: 760,
+    width: 960,
+    height: 560,
+    minWidth: 800,
+    minHeight: 540,
     show: false,
     backgroundColor: "#f4efe8",
     title: "Accio Bridge Desktop",

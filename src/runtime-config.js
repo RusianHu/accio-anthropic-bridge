@@ -51,6 +51,8 @@ function createConfig() {
     accessTokenExpiresAt: env("ACCIO_ACCESS_TOKEN_EXPIRES_AT", ""),
     gatewayAutostart: parseFlag(env("ACCIO_GATEWAY_AUTOSTART", "1"), true),
     appPath: discoverAccioAppPath(env("ACCIO_APP_PATH", "")),
+    desktopHelperUrl: env("ACCIO_DESKTOP_HELPER_URL", "http://127.0.0.1:8090"),
+    desktopHelperTimeoutMs: Number(env("ACCIO_DESKTOP_HELPER_TIMEOUT_MS", "15000")),
     gatewayWaitMs: Number(env("ACCIO_GATEWAY_WAIT_MS", "20000")),
     gatewayPollMs: Number(env("ACCIO_GATEWAY_POLL_MS", "500")),
     directLlmBaseUrl: env(
@@ -65,7 +67,7 @@ function createConfig() {
     maxRetries: Number(env("ACCIO_MAX_RETRIES", "2")),
     retryBaseMs: Number(env("ACCIO_RETRY_BASE_MS", "250")),
     retryMaxDelayMs: Number(env("ACCIO_RETRY_MAX_DELAY_MS", "2500")),
-    modelsSource: env("ACCIO_MODELS_SOURCE", "static"),
+    modelsSource: env("ACCIO_MODELS_SOURCE", "gateway"),
     modelsCacheTtlMs: Number(env("ACCIO_MODELS_CACHE_TTL_MS", "30000")),
     maxBodyBytes: Number(env("ACCIO_MAX_BODY_BYTES", String(10 * 1024 * 1024))),
     bodyReadTimeoutMs: Number(env("ACCIO_BODY_READ_TIMEOUT_MS", "30000")),

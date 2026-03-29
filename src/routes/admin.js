@@ -943,10 +943,10 @@ button { font: inherit; cursor: pointer; }
 
 /* ── Topbar ── */
 .topbar {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  display: flex;
+  flex-direction: row;
   gap: 10px;
-  align-items: start;
+  align-items: stretch;
   margin-bottom: 10px;
 }
 .titleBlock,
@@ -960,6 +960,7 @@ button { font: inherit; cursor: pointer; }
   -webkit-backdrop-filter: blur(12px);
 }
 .titleBlock {
+  flex: 1;
   padding: 14px 18px;
   animation: fadeSlideUp 0.4s ease-out;
 }
@@ -993,7 +994,7 @@ button { font: inherit; cursor: pointer; }
 
 /* ── Status Card ── */
 .statusCard {
-  min-width: 280px;
+  flex: 1;
   padding: 12px 14px;
   animation: fadeSlideUp 0.5s ease-out 0.1s both;
 }
@@ -1058,11 +1059,17 @@ button { font: inherit; cursor: pointer; }
 .kv dt { color: var(--muted); font-weight: 500; }
 .kv dd { margin: 0; word-break: break-word; color: var(--ink-secondary); }
 
-/* ── Main Grid ── */
-.mainGrid {
-  display: grid;
-  grid-template-columns: 280px minmax(0, 1fr);
-  gap: 10px;
+/* ── Action Panel (topbar slot) ── */
+.actionPanel {
+  flex: 1;
+  padding: 14px 16px;
+  animation: fadeSlideUp 0.4s ease-out 0.2s both;
+}
+
+/* ── Snapshot Panel (full-width) ── */
+.snapshotPanel {
+  padding: 14px 16px;
+  animation: fadeSlideUp 0.4s ease-out 0.25s both;
 }
 .panel {
   padding: 14px 16px;
@@ -1206,40 +1213,74 @@ button { font: inherit; cursor: pointer; }
 /* ── Snapshot List ── */
 .list {
   display: grid;
-  gap: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px;
   margin-top: 10px;
 }
 .item {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
-  align-items: center;
-  padding: 10px 12px;
-  border-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
   background: rgba(255,255,255,0.7);
   border: 1px solid var(--line);
   transition: all var(--transition-fast);
+  position: relative;
+  overflow: hidden;
+}
+.item::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: transparent;
+  transition: background var(--transition-fast);
 }
 .item:hover {
   background: rgba(255,255,255,0.95);
   box-shadow: var(--shadow-sm);
   border-color: var(--line-strong);
+  transform: translateY(-1px);
 }
+.item:active { transform: translateY(0); }
 .item.current-item {
-  border-left: 3px solid var(--good);
+  border-color: rgba(26,138,90,0.3);
   background: rgba(26,138,90,0.04);
+}
+.item.current-item::before { background: var(--good); }
+.itemAvatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent-soft), rgba(194,90,50,0.2));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--accent-deep);
+  flex-shrink: 0;
+  margin-bottom: 8px;
+  letter-spacing: -0.02em;
+}
+.item.current-item .itemAvatar {
+  background: linear-gradient(135deg, var(--good-soft), rgba(26,138,90,0.2));
+  color: var(--good);
 }
 .itemTitleRow {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   flex-wrap: wrap;
+  margin-bottom: 2px;
 }
 .itemTitle {
   margin: 0;
   font-size: 13px;
   font-weight: 600;
   letter-spacing: -0.01em;
+  word-break: break-all;
 }
 .pill {
   display: inline-flex;
@@ -1266,24 +1307,26 @@ button { font: inherit; cursor: pointer; }
   color: var(--accent-deep);
 }
 .itemMeta {
-  margin-top: 2px;
   color: var(--muted);
   font-size: 11px;
   line-height: 1.45;
   word-break: break-word;
+  margin-bottom: 2px;
 }
 .itemMeta.hint {
   color: var(--warn);
   font-style: italic;
 }
+.itemSpacer { flex: 1; }
 .actionRow {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
-  min-width: 88px;
+  flex-direction: row;
+  gap: 6px;
+  margin-top: 10px;
 }
 .actionRow .btn {
-  padding: 6px 10px;
+  flex: 1;
+  padding: 6px 8px;
   font-size: 11px;
   text-align: center;
   border-radius: var(--radius-sm);
@@ -1335,13 +1378,9 @@ button { font: inherit; cursor: pointer; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(24,22,20,0.25); }
 
 /* ── Responsive ── */
-@media (max-width: 980px) {
-  .topbar,
-  .mainGrid {
-    grid-template-columns: 1fr;
-  }
-  .statusCard {
-    min-width: 0;
+@media (max-width: 680px) {
+  .topbar {
+    flex-direction: column;
   }
 }
 @media (max-width: 720px) {
@@ -1350,12 +1389,8 @@ button { font: inherit; cursor: pointer; }
     padding-top: 10px;
     padding-bottom: 18px;
   }
-  .item {
-    grid-template-columns: 1fr;
-  }
-  .actionRow {
-    flex-direction: row;
-    min-width: 0;
+  .list {
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   }
 }
 </style>
@@ -1375,10 +1410,7 @@ button { font: inherit; cursor: pointer; }
       </div>
       <dl class="kv" id="overview-kv"></dl>
     </aside>
-  </section>
-
-  <section class="mainGrid">
-    <aside class="panel">
+    <aside class="panel actionPanel">
       <h2>\u8D26\u53F7\u64CD\u4F5C</h2>
       <div class="panelSub">\u65B0\u589E\u8D26\u53F7\u3001\u4FDD\u5B58\u5FEB\u7167\u3001\u767B\u51FA\u5F53\u524D\u8D26\u53F7\u3002</div>
       <div class="actionList">
@@ -1389,16 +1421,16 @@ button { font: inherit; cursor: pointer; }
       <div id="action-message" class="message info"></div>
       <div id="current-account-note" class="note note-info" style="display:none"></div>
     </aside>
+  </section>
 
-    <section class="panel">
-      <div class="sectionHeader">
-        <div>
-          <h2>\u5DF2\u8BB0\u5F55\u8D26\u53F7</h2>
-          <div class="panelSub">\u672C\u673A\u5DF2\u4FDD\u5B58\u7684\u8D26\u53F7\u3002\u70B9\u51FB\u201C\u5207\u6362\u201D\u5373\u53EF\u5207\u6362\u767B\u5F55\u8EAB\u4EFD\u3002</div>
-        </div>
+  <section class="panel snapshotPanel">
+    <div class="sectionHeader">
+      <div>
+        <h2>\u5DF2\u8BB0\u5F55\u8D26\u53F7</h2>
+        <div class="panelSub">\u672C\u673A\u5DF2\u4FDD\u5B58\u7684\u8D26\u53F7\u3002\u70B9\u51FB\u201C\u5207\u6362\u201D\u5373\u53EF\u5207\u6362\u767B\u5F55\u8EAB\u4EFD\u3002</div>
       </div>
-      <div class="list" id="snapshot-list"></div>
-    </section>
+    </div>
+    <div class="list" id="snapshot-list"></div>
   </section>
 </div>
 <script>
@@ -1505,22 +1537,27 @@ function renderSnapshots(data) {
   els.snapshotList.innerHTML = snapshots.map((item) => {
     const userId = item.gatewayUser && item.gatewayUser.id ? String(item.gatewayUser.id) : '';
     const userName = item.gatewayUser && item.gatewayUser.name ? String(item.gatewayUser.name) : '';
-    const label = userName ? (userName + (userId ? ' \xB7 ' + userId : '')) : (userId || item.alias);
+    const displayName = userName || userId || item.alias;
+    const subLabel = userName && userId ? userId : (userName ? '' : '');
+    const avatarChar = displayName ? displayName.charAt(0).toUpperCase() : '?';
     const current = currentUserId && userId && currentUserId === userId;
     const itemClass = current ? 'item current-item' : 'item';
     const statusPill = item.hasFullAuthState && item.hasAuthCallback
       ? '<span class="pill current">完整</span>'
       : (!item.hasFullAuthState ? '<span class="pill warn">旧快照</span>' : '<span class="pill warn">仅文件</span>');
     return '<div class="' + itemClass + '">'
-      + '<div>'
-      + '<div class="itemTitleRow"><h3 class="itemTitle">' + label + '</h3>'
+      + '<div class="itemAvatar">' + avatarChar + '</div>'
+      + '<div class="itemTitleRow">'
+      + '<h3 class="itemTitle">' + displayName + '</h3>'
       + (current ? '<span class="pill current">当前</span>' : '')
       + statusPill
       + '</div>'
-      + '<div class="itemMeta">' + item.alias + ' \xB7 ' + formatTime(item.capturedAt) + ' \xB7 ' + String(item.artifactCount || 0) + ' 个认证文件</div>'
-      + (!item.hasFullAuthState ? '<div class="itemMeta hint">旧格式快照，建议重新登录补全凭证</div>' : '')
-      + (!item.hasAuthCallback ? '<div class="itemMeta hint">缺少原生回调凭证，建议重新登录</div>' : '')
-      + '</div>'
+      + (subLabel ? '<div class="itemMeta">' + subLabel + '</div>' : '')
+      + '<div class="itemMeta">' + item.alias + '</div>'
+      + '<div class="itemMeta">' + formatTime(item.capturedAt) + ' &middot; ' + String(item.artifactCount || 0) + ' 个文件</div>'
+      + (!item.hasFullAuthState ? '<div class="itemMeta hint">旧格式快照，建议重新登录</div>' : '')
+      + (!item.hasAuthCallback ? '<div class="itemMeta hint">缺少原生回调，建议重新登录</div>' : '')
+      + '<div class="itemSpacer"></div>'
       + '<div class="actionRow"><button class="btn" data-activate-snapshot="' + item.alias + '">切换</button><button class="btn" data-delete-snapshot="' + item.alias + '">删除</button></div>'
       + '</div>';
   }).join('');

@@ -5,6 +5,7 @@ const crypto = require("node:crypto");
 const modelAliases = require("../config/model-aliases.json");
 
 const { shouldFailoverAccount } = require("./errors");
+const { extractGatewayModels } = require("./models");
 const { extractAccessToken } = require("./gateway-manager");
 const { normalizeRequestedModel } = require("./model");
 
@@ -16,12 +17,13 @@ function safeJsonParse(value, fallback = null) {
   }
 }
 
+const DEFAULT_PROVIDER_MODEL = "claude-opus-4-6";
+
 function mapRequestedModel(model, protocol) {
   const requested = normalizeRequestedModel(model);
-  const fallback = "claude-opus-4-6";
 
   if (!requested) {
-    return fallback;
+    return DEFAULT_PROVIDER_MODEL;
   }
 
   return modelAliases[requested] || requested;
@@ -792,9 +794,13 @@ class DirectLlmClient {
     this.config = config;
     this.authProvider = config.authProvider || null;
     this.gatewayManager = config.gatewayManager || null;
+    this.fetchImpl = config.fetchImpl || fetch;
     this._cachedToken = null;
     this._cachedAt = 0;
     this._cacheTtlMs = Number(config.authCacheTtlMs || 2 * 60 * 1000);
+    this._availableModels = null;
+    this._availableModelsAt = 0;
+    this._modelsCacheTtlMs = Number(config.modelsCacheTtlMs || 30 * 1000);
   }
 
   async getGatewayToken(options = {}) {
@@ -812,7 +818,7 @@ class DirectLlmClient {
       return result.token;
     }
 
-    const res = await fetch(`${this.config.localGatewayBaseUrl}/debug/auth/ws-status`);
+    const res = await this.fetchImpl(`${this.config.localGatewayBaseUrl}/debug/auth/ws-status`);
     const payload = await res.json();
     const token = extractAccessToken(payload);
 
@@ -858,6 +864,82 @@ class DirectLlmClient {
     this._cachedAt = 0;
   }
 
+  _isModelsCacheFresh() {
+    return this._availableModels && Date.now() - this._availableModelsAt < this._modelsCacheTtlMs;
+  }
+
+  async listAvailableModels() {
+    if (this._isModelsCacheFresh()) {
+      return this._availableModels;
+    }
+
+    const res = await this.fetchImpl(`${this.config.localGatewayBaseUrl}/models`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(Math.min(5000, Number(this.config.requestTimeoutMs || 5000)))
+    });
+
+    if (!res.ok) {
+      throw new Error(`Local gateway /models failed: ${res.status} ${res.statusText}`);
+    }
+
+    const models = extractGatewayModels(await res.json());
+    this._availableModels = new Set(models.map((item) => item.id));
+    this._availableModelsAt = Date.now();
+    return this._availableModels;
+  }
+
+  async resolveProviderModel(requestedModel) {
+    const requested = normalizeRequestedModel(requestedModel);
+    const normalized = mapRequestedModel(requestedModel);
+    let available = null;
+
+    try {
+      available = await this.listAvailableModels();
+    } catch {
+      return {
+        requestedModel: requested || null,
+        normalizedModel: normalized,
+        resolvedProviderModel: normalized || DEFAULT_PROVIDER_MODEL,
+        modelResolution: "alias"
+      };
+    }
+
+    if (!available || available.size === 0) {
+      return {
+        requestedModel: requested || null,
+        normalizedModel: normalized,
+        resolvedProviderModel: normalized || DEFAULT_PROVIDER_MODEL,
+        modelResolution: "alias"
+      };
+    }
+
+    const candidates = [];
+    if (requested) {
+      candidates.push(requested);
+    }
+    if (normalized && !candidates.includes(normalized)) {
+      candidates.push(normalized);
+    }
+
+    for (const candidate of candidates) {
+      if (available.has(candidate)) {
+        return {
+          requestedModel: requested || null,
+          normalizedModel: normalized,
+          resolvedProviderModel: candidate,
+          modelResolution: candidate === normalized ? "alias-match" : "direct-match"
+        };
+      }
+    }
+
+    return {
+      requestedModel: requested || null,
+      normalizedModel: normalized,
+      resolvedProviderModel: available.has(DEFAULT_PROVIDER_MODEL) ? DEFAULT_PROVIDER_MODEL : (normalized || DEFAULT_PROVIDER_MODEL),
+      modelResolution: "fallback"
+    };
+  }
+
   async isAvailable() {
     try {
       const auth = await this.getAuthToken({ allowAutostart: false });
@@ -872,6 +954,17 @@ class DirectLlmClient {
     const stickyAccountId = options.stickyAccountId || null;
     const triedAccounts = new Set();
     let lastError = null;
+    const modelInfo = await this.resolveProviderModel(request.model);
+
+    if (typeof options.onDecision === "function") {
+      options.onDecision({
+        type: "model_resolution",
+        requestedModel: modelInfo.requestedModel,
+        normalizedModel: modelInfo.normalizedModel,
+        resolvedProviderModel: modelInfo.resolvedProviderModel,
+        resolution: modelInfo.modelResolution
+      });
+    }
 
     while (true) {
       const auth = await this.getAuthToken({
@@ -892,19 +985,23 @@ class DirectLlmClient {
           accountId: auth.accountId,
           accountName: auth.accountName || null,
           authSource: auth.source,
-          resolvedProviderModel: request.model,
+          requestedModel: modelInfo.requestedModel,
+          normalizedModel: modelInfo.normalizedModel,
+          resolvedProviderModel: modelInfo.resolvedProviderModel,
+          resolution: modelInfo.modelResolution,
           thinking: request.thinking || null
         });
       }
 
       const upstreamBody = {
         ...request.requestBody,
+        model: modelInfo.resolvedProviderModel,
         token
       };
       let res;
 
       try {
-        res = await fetch(`${this.config.upstreamBaseUrl}/generateContent`, {
+        res = await this.fetchImpl(`${this.config.upstreamBaseUrl}/generateContent`, {
           method: "POST",
           headers: {
             "content-type": "application/json",
@@ -972,7 +1069,7 @@ class DirectLlmClient {
         throw new Error("Direct LLM response has no body");
       }
 
-      const state = new DirectResponseAccumulator(request.model);
+      const state = new DirectResponseAccumulator(modelInfo.resolvedProviderModel);
 
       for await (const frame of parseSseEvents(res.body)) {
         if (!frame) {
@@ -1041,7 +1138,7 @@ class DirectLlmClient {
         accountId: auth.accountId,
         accountName: auth.accountName || null,
         authSource: auth.source,
-        resolvedProviderModel: request.model,
+        resolvedProviderModel: modelInfo.resolvedProviderModel,
         thinking: request.thinking || null
       };
     }

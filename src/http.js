@@ -8,7 +8,21 @@ const CORS_HEADERS = Object.freeze({
 });
 
 function writeJson(res, statusCode, body, extraHeaders = {}) {
+  if (!res || res.writableEnded || res.destroyed) {
+    return false;
+  }
+
   const payload = JSON.stringify(body);
+
+  if (res.headersSent) {
+    try {
+      res.end();
+    } catch {
+      // Ignore secondary stream shutdown failures.
+    }
+    return false;
+  }
+
   res.writeHead(statusCode, {
     ...CORS_HEADERS,
     ...extraHeaders,
@@ -16,6 +30,7 @@ function writeJson(res, statusCode, body, extraHeaders = {}) {
     "content-length": Buffer.byteLength(payload)
   });
   res.end(payload);
+  return true;
 }
 
 function writeSse(res, event, data) {

@@ -25,7 +25,7 @@ function getStaticModels() {
   return getStaticModelIds().map((id) => buildModelRecord(id));
 }
 
-function extractGatewayModels(payload) {
+function flattenGatewayModelEntries(payload) {
   const rawList = Array.isArray(payload)
     ? payload
     : Array.isArray(payload && payload.data)
@@ -34,13 +34,49 @@ function extractGatewayModels(payload) {
         ? payload.models
         : [];
 
-  return rawList
+  const entries = [];
+
+  for (const item of rawList) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    if (Array.isArray(item.modelList)) {
+      for (const model of item.modelList) {
+        if (!model || typeof model !== "object") {
+          continue;
+        }
+
+        entries.push({
+          id: model.id || model.model || model.name || model.modelName || "",
+          visible: model.visible !== false,
+          provider: item.provider || model.provider || null,
+          owned_by: model.owned_by || model.ownedBy || item.provider || "accio",
+          raw_id: model.id || model.modelName || model.name || null,
+          providerDisplayName: item.providerDisplayName || null,
+          multimodal: model.multimodal === true,
+          contextWindow: Number(model.contextWindow || 0) || null,
+          thinkLevel: model.thinkLevel || null,
+          isDefault: model.isDefault === true
+        });
+      }
+      continue;
+    }
+
+    entries.push(item);
+  }
+
+  return entries;
+}
+
+function extractGatewayModels(payload) {
+  return flattenGatewayModelEntries(payload)
     .map((item) => {
       if (!item || typeof item !== "object" || item.visible === false) {
         return null;
       }
 
-      const id = String(item.id || item.model || item.name || "").trim();
+      const id = String(item.id || item.model || item.name || item.modelName || "").trim();
 
       if (!id) {
         return null;
@@ -53,7 +89,12 @@ function extractGatewayModels(payload) {
             source: "gateway",
             visible: item.visible !== false,
             provider: item.provider || null,
-            raw_id: item.id || null
+            raw_id: item.raw_id || item.id || item.modelName || null,
+            providerDisplayName: item.providerDisplayName || null,
+            multimodal: item.multimodal === true,
+            contextWindow: Number(item.contextWindow || 0) || null,
+            thinkLevel: item.thinkLevel || null,
+            isDefault: item.isDefault === true
           }
         }
       });
@@ -107,26 +148,22 @@ class ModelsRegistry {
       return this._cache;
     }
 
-    const staticModels = getStaticModels();
-    const source = String(this.config.modelsSource || "static").toLowerCase();
-    let models = staticModels;
+    const source = String(this.config.modelsSource || "gateway").toLowerCase();
+    let models = [];
 
-    if (source !== "static") {
-      try {
-        const gatewayModels = await this._fetchGatewayModels();
-        models = source === "gateway" ? mergeModels(gatewayModels) : mergeModels(staticModels, gatewayModels);
-      } catch (error) {
-        log.warn("models discovery failed", {
-          source,
-          error: error && error.message ? error.message : String(error)
-        });
-        models = staticModels;
-      }
+    try {
+      models = await this._fetchGatewayModels();
+    } catch (error) {
+      log.warn("models discovery failed", {
+        source,
+        error: error && error.message ? error.message : String(error)
+      });
+      models = [];
     }
 
-    this._cache = models;
+    this._cache = mergeModels(models);
     this._cacheAt = Date.now();
-    return models;
+    return this._cache;
   }
 }
 

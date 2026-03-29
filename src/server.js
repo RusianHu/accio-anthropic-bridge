@@ -20,9 +20,13 @@ const {
   handleAdminState,
   handleAdminSnapshotCreate,
   handleAdminSnapshotActivate,
+  handleAdminSnapshotDelete,
   handleAdminGatewayLogin,
   handleAdminGatewayLogout,
-  handleAdminCaptureAccount
+  handleAdminCaptureAccount,
+  handleAdminAccountLogin,
+  handleAdminAccountCallback,
+  handleAdminAccountLoginStatus
 } = require("./routes/admin");
 const { handleAccioAuthProbe, handleHealth } = require("./routes/health");
 const { handleCountTokens, handleMessagesRequest } = require("./routes/anthropic");
@@ -113,8 +117,12 @@ function createServer(config, client, directClient, authProvider, gatewayManager
             "GET /admin/api/state",
             "POST /admin/api/snapshots",
             "POST /admin/api/snapshots/activate",
+            "POST /admin/api/snapshots/delete",
             "POST /admin/api/gateway/login",
             "POST /admin/api/gateway/logout",
+            "POST /admin/api/accounts/login",
+            "GET /admin/api/accounts/callback",
+            "GET /admin/api/accounts/login-status",
             "POST /admin/api/accounts/capture",
             "GET /healthz",
             "GET /debug/accio-auth",
@@ -151,7 +159,13 @@ function createServer(config, client, directClient, authProvider, gatewayManager
       }
 
       if (req.method === "POST" && url.pathname === "/admin/api/snapshots/activate") {
-        await handleAdminSnapshotActivate(req, res, config);
+        await handleAdminSnapshotActivate(req, res, config, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/snapshots/delete") {
+        await handleAdminSnapshotDelete(req, res);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
         return;
       }
@@ -164,6 +178,24 @@ function createServer(config, client, directClient, authProvider, gatewayManager
 
       if (req.method === "POST" && url.pathname === "/admin/api/gateway/logout") {
         await handleAdminGatewayLogout(req, res, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/accounts/login") {
+        await handleAdminAccountLogin(req, res, config, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/admin/api/accounts/callback") {
+        await handleAdminAccountCallback(req, res, config, url, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/admin/api/accounts/login-status") {
+        await handleAdminAccountLoginStatus(req, res, config, url);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
         return;
       }
@@ -284,6 +316,16 @@ function createServer(config, client, directClient, authProvider, gatewayManager
           body: errorBody
         }
       });
+
+      if (res.headersSent || res.writableEnded || res.destroyed) {
+        log.warn("response already started; skipping JSON error write", {
+          ...requestMeta,
+          status: statusCode,
+          ms: Date.now() - startTime
+        });
+        captureTrace(traceStore, req, res, requestMeta, startTime);
+        return;
+      }
 
       writeJson(res, statusCode, errorBody);
       captureTrace(traceStore, req, res, requestMeta, startTime);

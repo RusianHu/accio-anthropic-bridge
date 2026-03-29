@@ -17,11 +17,31 @@ test("extractGatewayModels filters invisible entries", () => {
   assert.equal(models[0].id, "claude-opus-4-6");
 });
 
-test("ModelsRegistry hybrid mode merges static and gateway models", async () => {
+test("extractGatewayModels supports provider modelList payloads", () => {
+  const models = extractGatewayModels({
+    data: [
+      {
+        provider: "claude",
+        providerDisplayName: "Claude",
+        modelList: [
+          { modelName: "claude-opus-4-6", visible: true, multimodal: true },
+          { modelName: "hidden-model", visible: false }
+        ]
+      }
+    ]
+  });
+
+  assert.equal(models.length, 1);
+  assert.equal(models[0].id, "claude-opus-4-6");
+  assert.equal(models[0].accio.provider, "claude");
+  assert.equal(models[0].accio.multimodal, true);
+});
+
+test("ModelsRegistry returns gateway-discovered models only", async () => {
   const registry = new ModelsRegistry(
     {
       baseUrl: "http://127.0.0.1:4097",
-      modelsSource: "hybrid",
+      modelsSource: "gateway",
       modelsCacheTtlMs: 1000,
       requestTimeoutMs: 1000
     },
@@ -29,7 +49,12 @@ test("ModelsRegistry hybrid mode merges static and gateway models", async () => 
       fetchImpl: async () => ({
         ok: true,
         async json() {
-          return { data: [{ id: "dynamic-model", visible: true }] };
+          return {
+            data: [
+              { provider: "openai", modelList: [{ modelName: "gpt-5.4", visible: true }] },
+              { provider: "claude", modelList: [{ modelName: "claude-opus-4-6", visible: true }] }
+            ]
+          };
         }
       })
     }
@@ -38,6 +63,5 @@ test("ModelsRegistry hybrid mode merges static and gateway models", async () => 
   const models = await registry.listModels();
   const ids = models.map((model) => model.id);
 
-  assert.ok(ids.includes("dynamic-model"));
-  assert.ok(ids.includes("accio-bridge"));
+  assert.deepEqual(ids, ["claude-opus-4-6", "gpt-5.4"]);
 });
