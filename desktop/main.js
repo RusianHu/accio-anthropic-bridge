@@ -54,6 +54,12 @@ const DESKTOP_HELPER_PORT = Number(process.env.ACCIO_DESKTOP_HELPER_PORT || brid
 
 let desktopCommandServer = null;
 
+function createGuiLaunchEnv() {
+  const env = { ...process.env };
+  delete env.ELECTRON_RUN_AS_NODE;
+  return env;
+}
+
 function loadDesktopIcon() {
   try {
     const icon = nativeImage.createFromPath(DESKTOP_ICON_PATH);
@@ -86,14 +92,14 @@ async function launchAccioDesktopApp() {
 
   if (process.platform === 'darwin') {
     try {
-      await execFileAsync('open', ['-a', appPath]);
+      await execFileAsync('open', ['-a', appPath], { env: createGuiLaunchEnv() });
       return { ok: true, method: 'open -a', appPath };
     } catch (error) {
       attempts.push(error instanceof Error ? error.message : String(error));
     }
 
     try {
-      await execFileAsync('open', [appPath]);
+      await execFileAsync('open', [appPath], { env: createGuiLaunchEnv() });
       return { ok: true, method: 'open path', appPath };
     } catch (error) {
       attempts.push(error instanceof Error ? error.message : String(error));

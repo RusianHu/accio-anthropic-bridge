@@ -32,6 +32,12 @@ const QUOTA_CACHE_MAX = 64;
 const quotaCache = new Map();
 const SNAPSHOT_QUOTA_FILE = "quota-state.json";
 
+function createGuiLaunchEnv() {
+  const env = { ...process.env };
+  delete env.ELECTRON_RUN_AS_NODE;
+  return env;
+}
+
 function isQuotaPendingFailure(reason) {
   const text = String(reason || "").trim().toLowerCase();
   return text === "quota refresh pending" || /quota exhausted|quota precheck skipped/.test(text);
@@ -1078,7 +1084,9 @@ async function startAccioForSnapshot(config, processName) {
   });
 
   if (process.platform === 'darwin') {
-    await execFileAsync('open', [config.appPath]);
+    await execFileAsync('open', [config.appPath], {
+      env: createGuiLaunchEnv()
+    });
     return;
   }
 

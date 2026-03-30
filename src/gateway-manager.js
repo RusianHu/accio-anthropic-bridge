@@ -10,6 +10,12 @@ const { delay } = require("./utils");
 
 const execFileAsync = promisify(execFile);
 
+function createGuiLaunchEnv() {
+  const env = { ...process.env };
+  delete env.ELECTRON_RUN_AS_NODE;
+  return env;
+}
+
 function parseFlag(value, fallback = false) {
   if (value == null || value === "") {
     return fallback;
@@ -124,7 +130,9 @@ class GatewayManager {
 
     if (this.platform === "darwin") {
       const args = String(appPath).endsWith(".app") ? [appPath] : ["-a", appPath];
-      await execFileAsync("open", args);
+      await execFileAsync("open", args, {
+        env: createGuiLaunchEnv()
+      });
       return;
     }
 
