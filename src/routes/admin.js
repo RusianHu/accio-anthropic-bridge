@@ -1618,9 +1618,13 @@ button { font: inherit; cursor: pointer; }
 /* ── Section ── */
 .sectionHeader {
   display: flex;
-  align-items: start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+.sectionHeader > .btn {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 /* ── Snapshot List ── */
@@ -1942,6 +1946,31 @@ button { font: inherit; cursor: pointer; }
 }
 .fallbackCardBody {
   padding: 16px;
+  overflow: hidden;
+}
+.fallbackCard[data-collapsed="true"] .fallbackCardBody {
+  display: none;
+}
+/* 折叠按钮 */
+.fallbackCollapseBtn {
+  background: none;
+  border: none;
+  padding: 0 6px;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 200ms ease, color 200ms ease;
+  flex-shrink: 0;
+}
+.fallbackCollapseBtn:hover {
+  color: var(--ink);
+}
+.fallbackCard[data-collapsed="true"] .fallbackCollapseBtn {
+  transform: rotate(-90deg);
 }
 /* iOS-style toggle switch */
 .toggleRow {
@@ -2102,14 +2131,14 @@ button { font: inherit; cursor: pointer; }
   line-height: 1.6;
 }
 .settingsFooter {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 12px;
 }
 .settingsActions {
   display: flex;
   align-items: center;
   gap: 10px;
-  flex-wrap: wrap;
 }
 .settingsMeta {
   display: grid;
@@ -2619,13 +2648,23 @@ function renderFallbackTargets() {
     return;
   }
 
+  // 保留已有卡片的折叠状态
+  const collapsedIds = new Set();
+  if (els.fallbackTargets) {
+    els.fallbackTargets.querySelectorAll('[data-fallback-item][data-collapsed="true"]').forEach((el) => {
+      const id = el.getAttribute('data-fallback-id');
+      if (id) collapsedIds.add(id);
+    });
+  }
+
   const targets = Array.isArray(fallbackDraft) ? fallbackDraft : [];
   els.fallbackEmpty.style.display = targets.length === 0 ? '' : 'none';
   els.fallbackTargets.innerHTML = targets.map((target, index) => {
     const protocolLabel = target.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI';
     const enabledAttr = target.enabled ? 'true' : 'false';
-    return '<section class="fallbackCard" data-fallback-item data-fallback-id="' + escapeInline(target.id) + '" data-enabled="' + enabledAttr + '">'
-      + '<div class="fallbackCardHeader">'
+    const collapsed = collapsedIds.has(target.id) ? ' data-collapsed="true"' : '';
+    return '<section class="fallbackCard" data-fallback-item data-fallback-id="' + escapeInline(target.id) + '" data-enabled="' + enabledAttr + '"' + collapsed + '>'
+      + '<div class="fallbackCardHeader" data-toggle-collapse="' + escapeInline(target.id) + '" style="cursor:pointer">'
       + '<span class="fallbackCardIndex">' + (index + 1) + '</span>'
       + '<div class="fallbackCardTitle">'
       + '<strong>' + escapeInline(target.name || ('渠道 ' + (index + 1))) + '</strong>'
@@ -2637,6 +2676,7 @@ function renderFallbackTargets() {
       + '<button class="btn" type="button" data-move-down-fallback="' + escapeInline(target.id) + '"' + (index === targets.length - 1 ? ' disabled' : '') + '>↓ 下移</button>'
       + '<button class="btn" type="button" data-test-fallback="' + escapeInline(target.id) + '">⚡ 测试</button>'
       + '<button class="btn warn" type="button" data-delete-fallback="' + escapeInline(target.id) + '">✕ 删除</button>'
+      + '<button class="fallbackCollapseBtn" type="button" data-collapse-fallback="' + escapeInline(target.id) + '" title="折叠/展开">▼</button>'
       + '</div>'
       + '</div>'
       + '<div class="fallbackCardBody">'
@@ -3049,6 +3089,23 @@ if (els.reloadFallbackConfigBtn) {
 
 if (els.fallbackTargets) {
   els.fallbackTargets.addEventListener('click', async (event) => {
+    // 折叠/展开（按钮或整个 header 点击）
+    const collapseBtn = event.target.closest('[data-collapse-fallback]');
+    const collapseHeader = !collapseBtn && event.target.closest('[data-toggle-collapse]');
+    if (collapseBtn || collapseHeader) {
+      // 如果是 header 点击但点到了 action 按钮区域，不触发折叠
+      if (collapseHeader && event.target.closest('.fallbackCardActions')) {
+        // fall through
+      } else {
+        const card = (collapseBtn || collapseHeader).closest('[data-fallback-item]');
+        if (card) {
+          const isCollapsed = card.getAttribute('data-collapsed') === 'true';
+          card.setAttribute('data-collapsed', isCollapsed ? 'false' : 'true');
+        }
+        if (collapseBtn) return;
+      }
+    }
+
     const toggle = event.target.closest('[data-toggle-secret]');
     if (toggle) {
       const input = toggle.closest('.inputWrap') ? toggle.closest('.inputWrap').querySelector('input[data-field="apiKey"]') : null;
