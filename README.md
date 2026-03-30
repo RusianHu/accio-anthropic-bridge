@@ -3,7 +3,7 @@
 把 Anthropic / OpenAI 风格请求桥接到 Accio 本地登录态和网关的本地代理。
 
 - Anthropic Messages API + OpenAI Chat Completions + Responses 最小子集
-- 优先直连 `phoenix-gw`，回退到 Accio 本地 WebSocket
+- 优先直连 `phoenix-gw`，回退到 Accio 本地 WebSocket，必要时再落到外部 OpenAI 兼容上游
 - 多账号轮询 / failover / 本机快照管理
 - 可视化管理台 + Electron 桌面壳
 
@@ -201,12 +201,18 @@ ACCIO_GATEWAY_POLL_MS=500
 ACCIO_MODELS_SOURCE=static        # static | gateway | hybrid
 ACCIO_MODELS_CACHE_TTL_MS=30000
 ACCIO_DIRECT_LLM_BASE_URL=https://phoenix-gw.alibaba.com/api/adk/llm
+ACCIO_FALLBACK_OPENAI_BASE_URL=     # 可选，最后兜底的 OpenAI 兼容上游
+ACCIO_FALLBACK_OPENAI_API_KEY=
+ACCIO_FALLBACK_OPENAI_MODEL=
+ACCIO_FALLBACK_OPENAI_TIMEOUT_MS=60000
 
 # 安全防护
 ACCIO_MAX_BODY_BYTES=10485760
 ACCIO_BODY_READ_TIMEOUT_MS=30000
 ACCIO_AUTH_CACHE_TTL_MS=120000
 ACCIO_DEFAULT_MAX_OUTPUT_TOKENS=4096
+ACCIO_QUOTA_PREFLIGHT_ENABLED=1
+ACCIO_QUOTA_CACHE_TTL_MS=30000
 
 # 缓存
 ACCIO_RESPONSE_CACHE_TTL_MS=10000
@@ -246,6 +252,9 @@ LOG_LEVEL=info
 
 - **默认输出上限**：客户端没传 `max_tokens` 时自动补 `ACCIO_DEFAULT_MAX_OUTPUT_TOKENS`（默认 4096）
 - **短 TTL 精确请求缓存**：只缓存完全相同输入的非流式纯文本请求，默认 TTL 10s，容量 128 条。不缓存 tools/thinking/图片/流式请求
+- **额度预检跳过**：默认会在 `direct-llm` 发送前检查当前候选账号额度；若已 100% 且还有其他候选账号，则本次请求直接切到下一个账号
+- **透明切号边界**：仅当上游在首个输出发给客户端之前报 quota/auth/overloaded 类错误时，bridge 才会自动在同一请求内切到下一个账号；一旦流式输出已经开始，就只记录失败，不会伪造续写
+- **外部上游兜底**：配置 `ACCIO_FALLBACK_OPENAI_*` 后，若账号池和本地链路因 quota/auth/timeout/5xx 等原因失败，bridge 会把纯文本请求转发到额外的 OpenAI 兼容上游；tools、thinking、图片请求不会静默降级
 
 命中缓存时返回 `x-accio-cache: hit`。
 
@@ -255,6 +264,9 @@ LOG_LEVEL=info
 - `x-accio-conversation-id` 直接绑定已有 conversation
 - `x-accio-account-id` 按请求指定账号
 - 会话级账号粘性和可识别错误下的多账号 failover
+- 额度预检会优先跳过已满额账号；流式请求仅在首个输出前支持透明切号重试
+- 可选外部 OpenAI 兼容 fallback，仅对纯文本请求生效
+- 管理台账号卡片展示额度状态和刷新倒计时（短 TTL 缓存）
 - 自动发现 Accio 本地 agent / workspace / source
 - 对本地网关超时/连接失败/429/5xx 做错误分类和指数退避重试
 - 响应顶层附加 `accio.*` 调试字段

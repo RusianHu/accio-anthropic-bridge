@@ -25,6 +25,7 @@ function createConfig() {
   });
 
   return {
+    envPath: path.join(process.cwd(), ".env"),
     port: Number(env("PORT", "8082")),
     baseUrl: env("ACCIO_BASE_URL", "http://127.0.0.1:4097"),
     accioHome: discovered.accioHome,
@@ -59,6 +60,12 @@ function createConfig() {
       "ACCIO_DIRECT_LLM_BASE_URL",
       "https://phoenix-gw.alibaba.com/api/adk/llm"
     ),
+    fallbackOpenAiBaseUrl: env("ACCIO_FALLBACK_OPENAI_BASE_URL", ""),
+    fallbackOpenAiApiKey: env("ACCIO_FALLBACK_OPENAI_API_KEY", ""),
+    fallbackOpenAiModel: env("ACCIO_FALLBACK_OPENAI_MODEL", ""),
+    fallbackOpenAiProtocol: env("ACCIO_FALLBACK_PROTOCOL", "openai"),
+    fallbackAnthropicVersion: env("ACCIO_FALLBACK_ANTHROPIC_VERSION", "2023-06-01"),
+    fallbackOpenAiTimeoutMs: Number(env("ACCIO_FALLBACK_OPENAI_TIMEOUT_MS", "60000")),
     clientIdPrefix: env("ACCIO_CLIENT_ID_PREFIX", "anthropic-bridge"),
     sessionStorePath: env(
       "ACCIO_SESSION_STORE_PATH",
@@ -72,6 +79,8 @@ function createConfig() {
     maxBodyBytes: Number(env("ACCIO_MAX_BODY_BYTES", String(10 * 1024 * 1024))),
     bodyReadTimeoutMs: Number(env("ACCIO_BODY_READ_TIMEOUT_MS", "30000")),
     authCacheTtlMs: Number(env("ACCIO_AUTH_CACHE_TTL_MS", String(2 * 60 * 1000))),
+    quotaPreflightEnabled: parseFlag(env("ACCIO_QUOTA_PREFLIGHT_ENABLED", "1"), true),
+    quotaCacheTtlMs: Number(env("ACCIO_QUOTA_CACHE_TTL_MS", "30000")),
     defaultMaxOutputTokens: Number(env("ACCIO_DEFAULT_MAX_OUTPUT_TOKENS", "4096")),
     responseCacheTtlMs: Number(env("ACCIO_RESPONSE_CACHE_TTL_MS", "10000")),
     responseCacheMaxEntries: Number(env("ACCIO_RESPONSE_CACHE_MAX_ENTRIES", "128")),

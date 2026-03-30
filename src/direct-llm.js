@@ -1,6 +1,8 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const modelAliases = require("../config/model-aliases.json");
 
@@ -18,6 +20,29 @@ function safeJsonParse(value, fallback = null) {
 }
 
 const DEFAULT_PROVIDER_MODEL = "claude-opus-4-6";
+
+function readAccioUtdid(accioHome) {
+  const base = String(accioHome || "").trim();
+  if (!base) {
+    return "";
+  }
+
+  try {
+    return fs.readFileSync(path.join(base, "utdid"), "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function extractCnaFromCookie(rawCookie) {
+  if (!rawCookie) {
+    return "";
+  }
+
+  const text = String(rawCookie);
+  const match = text.match(/(?:^|%3B\s*|;\s*)cna(?:=|%3D)([^;%]+)/i);
+  return match ? decodeURIComponent(match[1]) : "";
+}
 
 function mapRequestedModel(model, protocol) {
   const requested = normalizeRequestedModel(model);
@@ -394,6 +419,20 @@ class DirectResponseAccumulator {
     this.usage = null;
     this.currentTool = null;
     this.error = null;
+    this.emittedEvents = 0;
+  }
+
+  emit(event, onEvent) {
+    if (typeof onEvent !== "function" || !event || typeof event !== "object") {
+      return;
+    }
+
+    this.emittedEvents += 1;
+    onEvent(event);
+  }
+
+  hasVisibleOutput() {
+    return this.emittedEvents > 0;
   }
 
   applyNormalizedParts(parts, onEvent) {
@@ -401,9 +440,7 @@ class DirectResponseAccumulator {
       if (typeof part.text === "string" && part.text) {
         this.text += part.text;
 
-        if (typeof onEvent === "function") {
-          onEvent({ type: "text_delta", text: part.text });
-        }
+        this.emit({ type: "text_delta", text: part.text }, onEvent);
       }
 
       const functionCall = part.functionCall || part.function_call;
@@ -429,9 +466,7 @@ class DirectResponseAccumulator {
       return;
     }
 
-    if (typeof onEvent === "function") {
-      onEvent({ type: "claude_raw", raw });
-    }
+    this.emit({ type: "claude_raw", raw }, onEvent);
 
     if (raw.type === "message_start" && raw.message) {
       this.id = raw.message.id || this.id;
@@ -462,8 +497,8 @@ class DirectResponseAccumulator {
         const deltaText = raw.delta.text || "";
         this.text += deltaText;
 
-        if (typeof onEvent === "function" && deltaText) {
-          onEvent({ type: "text_delta", text: deltaText });
+        if (deltaText) {
+          this.emit({ type: "text_delta", text: deltaText }, onEvent);
         }
 
         return;
@@ -488,9 +523,7 @@ class DirectResponseAccumulator {
         this.toolCalls.push(toolCall);
       }
 
-      if (typeof onEvent === "function") {
-        onEvent({ type: "tool_call", toolCall });
-      }
+      this.emit({ type: "tool_call", toolCall }, onEvent);
 
       this.currentTool = null;
       return;
@@ -801,6 +834,10 @@ class DirectLlmClient {
     this._availableModels = null;
     this._availableModelsAt = 0;
     this._modelsCacheTtlMs = Number(config.modelsCacheTtlMs || 30 * 1000);
+    this._quotaPreflightEnabled = config.quotaPreflightEnabled !== false;
+    this._quotaCacheTtlMs = Number(config.quotaCacheTtlMs || 30 * 1000);
+    this._quotaCache = new Map();
+    this._utdid = readAccioUtdid(config.accioHome);
   }
 
   async getGatewayToken(options = {}) {
@@ -862,6 +899,195 @@ class DirectLlmClient {
   clearTokenCache() {
     this._cachedToken = null;
     this._cachedAt = 0;
+  }
+
+  _getQuotaCacheKey(auth) {
+    return `${String(auth && auth.accountId ? auth.accountId : "")}:${String(auth && auth.token ? auth.token : "")}`;
+  }
+
+  _getCachedQuota(auth) {
+    const key = this._getQuotaCacheKey(auth);
+    const cached = this._quotaCache.get(key);
+    if (!cached) {
+      return null;
+    }
+
+    if (Date.now() - cached.at >= this._quotaCacheTtlMs) {
+      this._quotaCache.delete(key);
+      return null;
+    }
+
+    return cached.value;
+  }
+
+  _setCachedQuota(auth, value) {
+    const key = this._getQuotaCacheKey(auth);
+    this._quotaCache.set(key, { at: Date.now(), value });
+    return value;
+  }
+
+  _getQuotaRefreshUntilMs(quota) {
+    const seconds = Number(quota && quota.refreshCountdownSeconds);
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      return null;
+    }
+
+    return Date.now() + (Math.max(1, Math.floor(seconds)) * 1000);
+  }
+
+  async fetchQuotaStatus(auth) {
+    if (!this._quotaPreflightEnabled || !auth || !auth.accountId || !auth.token || !auth.cookie) {
+      return null;
+    }
+
+    const cached = this._getCachedQuota(auth);
+    if (cached) {
+      return cached;
+    }
+
+    const url = new URL("/api/entitlement/quota", this.config.upstreamBaseUrl);
+    url.searchParams.set("accessToken", String(auth.token));
+    url.searchParams.set("utdid", this._utdid || "");
+    url.searchParams.set("version", "0.0.0");
+
+    const response = await this.fetchImpl(url, {
+      method: "GET",
+      headers: {
+        "x-language": this.config.language ? String(this.config.language) : "zh",
+        "x-utdid": this._utdid || "",
+        "x-app-version": "0.0.0",
+        "x-os": process.platform,
+        "x-cna": extractCnaFromCookie(auth.cookie),
+        accept: "application/json, text/plain, */*"
+      },
+      signal: AbortSignal.timeout(Math.min(4000, Number(this.config.requestTimeoutMs || 4000)))
+    });
+
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload || payload.success !== true || !payload.data) {
+      const message = payload && payload.message ? String(payload.message) : `HTTP ${response.status}`;
+      throw new Error(`Quota request failed: ${message}`);
+    }
+
+    return this._setCachedQuota(auth, {
+      available: true,
+      usagePercent: Number(payload.data.usagePercent),
+      refreshCountdownSeconds: Number(payload.data.refreshCountdownSeconds),
+      checkedAt: new Date().toISOString()
+    });
+  }
+
+  async shouldSkipAccountByQuota(auth, options = {}) {
+    if (!this._quotaPreflightEnabled || !auth || !auth.accountId || options.explicitAccountId) {
+      return { skip: false, quota: null };
+    }
+
+    let quota = null;
+    try {
+      quota = await this.fetchQuotaStatus(auth);
+    } catch (error) {
+      if (typeof options.onDecision === "function") {
+        options.onDecision({
+          type: "quota_check_failed",
+          accountId: auth.accountId,
+          accountName: auth.accountName || null,
+          authSource: auth.source,
+          reason: error && error.message ? error.message : String(error),
+          status: null
+        });
+      }
+      return { skip: false, quota: null };
+    }
+
+    const usagePercent = Number(quota && quota.usagePercent);
+    if (!Number.isFinite(usagePercent) || usagePercent < 100 || !this.authProvider) {
+      return { skip: false, quota };
+    }
+
+    const refreshUntilMs = this._getQuotaRefreshUntilMs(quota);
+    const reason = usagePercent !== null
+      ? `quota precheck skipped account at ${Math.round(usagePercent)}%`
+      : "quota precheck skipped account";
+
+    if (typeof this.authProvider.invalidateAccountUntil === "function") {
+      this.authProvider.invalidateAccountUntil(auth.accountId, refreshUntilMs, reason);
+    } else if (typeof this.authProvider.invalidateAccount === "function") {
+      this.authProvider.invalidateAccount(auth.accountId, reason, refreshUntilMs);
+    }
+
+    const next = this.authProvider.resolveCredential({
+      stickyAccountId: options.stickyAccountId,
+      excludeIds: [...(options.excludeIds || []), auth.accountId]
+    });
+
+    if (!next || !next.accountId) {
+      return { skip: false, quota };
+    }
+
+    return { skip: true, quota };
+  }
+
+  _canContinueFailover(auth, triedAccounts, stickyAccountId) {
+    const next = this.authProvider
+      ? this.authProvider.resolveCredential({
+          stickyAccountId,
+          excludeIds: [...triedAccounts]
+        })
+      : null;
+
+    if (next && next.accountId && !triedAccounts.has(next.accountId)) {
+      return true;
+    }
+
+    return String(this.config.authMode || "auto") === "auto" && auth && auth.source !== "gateway";
+  }
+
+  _maybeContinueAfterAccountError({
+    auth,
+    error,
+    explicitAccountId,
+    stickyAccountId,
+    triedAccounts,
+    onDecision,
+    responseStarted,
+    phase
+  }) {
+    if (!shouldFailoverAccount(error) || explicitAccountId || !auth || !auth.accountId) {
+      return false;
+    }
+
+    if (responseStarted) {
+      if (typeof onDecision === "function") {
+        onDecision({
+          type: "account_failover_blocked",
+          accountId: auth.accountId,
+          accountName: auth.accountName || null,
+          authSource: auth.source,
+          reason: error && error.message ? error.message : String(error),
+          status: error && error.status ? error.status : null,
+          phase: phase || null,
+          responseStarted: true
+        });
+      }
+      return false;
+    }
+
+    triedAccounts.add(auth.accountId);
+
+    if (typeof onDecision === "function") {
+      onDecision({
+        type: "account_failover",
+        accountId: auth.accountId,
+        accountName: auth.accountName || null,
+        authSource: auth.source,
+        reason: error && error.message ? error.message : String(error),
+        status: error && error.status ? error.status : null,
+        phase: phase || null,
+        responseStarted: false
+      });
+    }
+
+    return this._canContinueFailover(auth, triedAccounts, stickyAccountId);
   }
 
   _isModelsCacheFresh() {
@@ -982,6 +1208,36 @@ class DirectLlmClient {
         throw new Error("Accio access token is unavailable");
       }
 
+      const quotaDecision = await this.shouldSkipAccountByQuota(auth, {
+        explicitAccountId,
+        stickyAccountId,
+        excludeIds: [...triedAccounts],
+        onDecision: options.onDecision
+      });
+
+      if (quotaDecision.skip && auth.accountId && this.authProvider) {
+        const usagePercent = quotaDecision.quota && Number.isFinite(Number(quotaDecision.quota.usagePercent))
+          ? Number(quotaDecision.quota.usagePercent)
+          : null;
+        const reason = usagePercent !== null
+          ? `quota precheck skipped account at ${Math.round(usagePercent)}%`
+          : "quota precheck skipped account";
+        triedAccounts.add(auth.accountId);
+
+        if (typeof options.onDecision === "function") {
+          options.onDecision({
+            type: "account_failover",
+            accountId: auth.accountId,
+            accountName: auth.accountName || null,
+            authSource: auth.source,
+            reason,
+            status: 429
+          });
+        }
+
+        continue;
+      }
+
       if (typeof options.onDecision === "function") {
         options.onDecision({
           type: "direct_attempt",
@@ -1042,32 +1298,20 @@ class DirectLlmClient {
           this.authProvider.invalidateAccount(auth.accountId, upstreamError.message);
         }
 
-        if (shouldFailoverAccount(upstreamError) && !explicitAccountId && auth.accountId) {
-          triedAccounts.add(auth.accountId);
+        const shouldContinue = this._maybeContinueAfterAccountError({
+          auth,
+          error: upstreamError,
+          explicitAccountId,
+          stickyAccountId,
+          triedAccounts,
+          onDecision: options.onDecision,
+          responseStarted: false,
+          phase: "http"
+        });
+
+        if (shouldContinue) {
           lastError = upstreamError;
-
-          if (typeof options.onDecision === "function") {
-            options.onDecision({
-              type: "account_failover",
-              accountId: auth.accountId,
-              accountName: auth.accountName || null,
-              reason: upstreamError.message,
-              status: upstreamError.status
-            });
-          }
-
-          const next = this.authProvider
-            ? this.authProvider.resolveCredential({ stickyAccountId, excludeIds: [...triedAccounts] })
-            : null;
-
-          if (next && !triedAccounts.has(next.accountId || "")) {
-            continue;
-          }
-
-          if (String(this.config.authMode || "auto") === "auto" && auth.source !== "gateway") {
-            triedAccounts.add(auth.accountId);
-            continue;
-          }
+          continue;
         }
 
         throw upstreamError;
@@ -1105,27 +1349,20 @@ class DirectLlmClient {
           this.authProvider.invalidateAccount(auth.accountId, state.error.message);
         }
 
-        if (shouldFailoverAccount(state.error) && !explicitAccountId && auth.accountId) {
-          triedAccounts.add(auth.accountId);
+        const shouldContinue = this._maybeContinueAfterAccountError({
+          auth,
+          error: state.error,
+          explicitAccountId,
+          stickyAccountId,
+          triedAccounts,
+          onDecision: options.onDecision,
+          responseStarted: state.hasVisibleOutput(),
+          phase: "stream"
+        });
+
+        if (shouldContinue) {
           lastError = state.error;
-
-          if (typeof options.onDecision === "function") {
-            options.onDecision({
-              type: "account_failover",
-              accountId: auth.accountId,
-              accountName: auth.accountName || null,
-              reason: state.error.message,
-              status: state.error.status || null
-            });
-          }
-
-          const next = this.authProvider
-            ? this.authProvider.resolveCredential({ stickyAccountId, excludeIds: [...triedAccounts] })
-            : null;
-
-          if (next && !triedAccounts.has(next.accountId || "")) {
-            continue;
-          }
+          continue;
         }
 
         throw state.error;

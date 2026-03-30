@@ -249,3 +249,535 @@ test("DirectLlmClient resolves against gateway models and falls back to opus", a
   assert.equal(second.resolvedProviderModel, 'claude-opus-4-6');
   assert.deepEqual(seenModels, ['gpt-5.4', 'claude-opus-4-6']);
 });
+
+
+test("DirectLlmClient skips a saturated account before generateContent when another account is available", async () => {
+  const seen = [];
+  const decisions = [];
+  const authProvider = {
+    resolveCredential(options = {}) {
+      const excluded = new Set(Array.isArray(options.excludeIds) ? options.excludeIds : []);
+      if (!excluded.has("acct_full")) {
+        return {
+          accountId: "acct_full",
+          accountName: "Full",
+          token: "token_full",
+          cookie: "cna=full-cna",
+          source: "accounts-file"
+        };
+      }
+
+      if (!excluded.has("acct_ok")) {
+        return {
+          accountId: "acct_ok",
+          accountName: "Okay",
+          token: "token_ok",
+          cookie: "cna=ok-cna",
+          source: "accounts-file"
+        };
+      }
+
+      return null;
+    }
+  };
+
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+
+    if (value.includes('/api/entitlement/quota')) {
+      const parsed = new URL(value);
+      const token = parsed.searchParams.get('accessToken');
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            success: true,
+            data: {
+              usagePercent: token === 'token_full' ? 100 : 20,
+              refreshCountdownSeconds: 3600
+            }
+          };
+        }
+      };
+    }
+
+    if (value.endsWith('/models')) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        async json() {
+          return {
+            data: [
+              { provider: 'claude', modelList: [{ modelName: 'claude-opus-4-6', visible: true }] }
+            ]
+          };
+        }
+      };
+    }
+
+    if (value.includes('/generateContent')) {
+      const body = JSON.parse(options.body || '{}');
+      seen.push(body.token);
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data:{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}\n\n'));
+            controller.close();
+          }
+        })
+      };
+    }
+
+    throw new Error('Unexpected URL: ' + value);
+  };
+
+  const client = new DirectLlmClient({
+    authMode: 'file',
+    authProvider,
+    requestTimeoutMs: 1000,
+    quotaPreflightEnabled: true,
+    quotaCacheTtlMs: 30000,
+    modelsCacheTtlMs: 1000,
+    localGatewayBaseUrl: 'http://127.0.0.1:4097',
+    upstreamBaseUrl: 'https://example.test/api/adk/llm',
+    fetchImpl
+  });
+
+  const result = await client.run(
+    { model: 'claude-opus-4-6', requestBody: { model: 'claude-opus-4-6' } },
+    { onDecision(event) { decisions.push(event); } }
+  );
+
+  assert.equal(result.accountId, 'acct_ok');
+  assert.deepEqual(seen, ['token_ok']);
+  assert.ok(decisions.some((event) => event.type === 'account_failover' && event.accountId === 'acct_full' && /quota precheck skipped/.test(event.reason || '')));
+});
+
+test("DirectLlmClient cools down a saturated account until refresh time instead of rechecking every request", async () => {
+  const quotaRequests = [];
+  const invalidUntilById = new Map();
+  const authProvider = {
+    resolveCredential(options = {}) {
+      const excluded = new Set(Array.isArray(options.excludeIds) ? options.excludeIds : []);
+      const candidates = [
+        {
+          accountId: 'acct_full',
+          accountName: 'Full',
+          token: 'token_full',
+          cookie: 'cna=full-cna',
+          source: 'accounts-file'
+        },
+        {
+          accountId: 'acct_ok',
+          accountName: 'Okay',
+          token: 'token_ok',
+          cookie: 'cna=ok-cna',
+          source: 'accounts-file'
+        }
+      ];
+
+      return candidates.find((candidate) => {
+        const invalidUntil = invalidUntilById.get(candidate.accountId) || 0;
+        return !excluded.has(candidate.accountId) && invalidUntil <= Date.now();
+      }) || null;
+    },
+    invalidateAccountUntil(accountId, untilMs) {
+      invalidUntilById.set(accountId, Number(untilMs || 0));
+    }
+  };
+
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+
+    if (value.includes('/api/entitlement/quota')) {
+      const parsed = new URL(value);
+      const token = parsed.searchParams.get('accessToken');
+      quotaRequests.push(token);
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            success: true,
+            data: {
+              usagePercent: token === 'token_full' ? 100 : 20,
+              refreshCountdownSeconds: 3600
+            }
+          };
+        }
+      };
+    }
+
+    if (value.endsWith('/models')) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        async json() {
+          return {
+            data: [
+              { provider: 'claude', modelList: [{ modelName: 'claude-opus-4-6', visible: true }] }
+            ]
+          };
+        }
+      };
+    }
+
+    if (value.includes('/generateContent')) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data:{"content":{"parts":[{"text":"ok"}]}}\n\n'));
+            controller.close();
+          }
+        })
+      };
+    }
+
+    throw new Error('Unexpected URL: ' + value);
+  };
+
+  const client = new DirectLlmClient({
+    authMode: 'file',
+    authProvider,
+    requestTimeoutMs: 1000,
+    quotaPreflightEnabled: true,
+    quotaCacheTtlMs: 30000,
+    modelsCacheTtlMs: 1000,
+    localGatewayBaseUrl: 'http://127.0.0.1:4097',
+    upstreamBaseUrl: 'https://example.test/api/adk/llm',
+    fetchImpl
+  });
+
+  await client.run({ model: 'claude-opus-4-6', requestBody: { model: 'claude-opus-4-6' } });
+  await client.run({ model: 'claude-opus-4-6', requestBody: { model: 'claude-opus-4-6' } });
+
+  assert.equal(quotaRequests.filter((token) => token === 'token_full').length, 1);
+  assert.ok(quotaRequests.filter((token) => token === 'token_ok').length >= 1);
+  assert.ok((invalidUntilById.get('acct_full') || 0) > Date.now());
+});
+
+test("DirectLlmClient does not quota-skip an explicitly requested account", async () => {
+  const seen = [];
+  const authProvider = {
+    resolveCredential(options = {}) {
+      if (options.accountId === 'acct_full') {
+        return {
+          accountId: 'acct_full',
+          accountName: 'Full',
+          token: 'token_full',
+          cookie: 'cna=full-cna',
+          source: 'accounts-file'
+        };
+      }
+      return null;
+    }
+  };
+
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+    if (value.endsWith('/models')) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        async json() {
+          return { data: [{ provider: 'claude', modelList: [{ modelName: 'claude-opus-4-6', visible: true }] }] };
+        }
+      };
+    }
+
+    if (value.includes('/generateContent')) {
+      const body = JSON.parse(options.body || '{}');
+      seen.push(body.token);
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data:{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}\n\n'));
+            controller.close();
+          }
+        })
+      };
+    }
+
+    if (value.includes('/api/entitlement/quota')) {
+      throw new Error('quota endpoint should not be called for explicit account');
+    }
+
+    throw new Error('Unexpected URL: ' + value);
+  };
+
+  const client = new DirectLlmClient({
+    authMode: 'file',
+    authProvider,
+    requestTimeoutMs: 1000,
+    quotaPreflightEnabled: true,
+    quotaCacheTtlMs: 30000,
+    modelsCacheTtlMs: 1000,
+    localGatewayBaseUrl: 'http://127.0.0.1:4097',
+    upstreamBaseUrl: 'https://example.test/api/adk/llm',
+    fetchImpl
+  });
+
+  const result = await client.run({ model: 'claude-opus-4-6', requestBody: { model: 'claude-opus-4-6' } }, { accountId: 'acct_full' });
+
+  assert.equal(result.accountId, 'acct_full');
+  assert.deepEqual(seen, ['token_full']);
+});
+
+test("DirectLlmClient transparently retries a stream failure before any output is emitted", async () => {
+  const decisions = [];
+  const events = [];
+  const seenTokens = [];
+  const authProvider = {
+    resolveCredential(options = {}) {
+      const excluded = new Set(Array.isArray(options.excludeIds) ? options.excludeIds : []);
+      if (!excluded.has('acct_first')) {
+        return {
+          accountId: 'acct_first',
+          accountName: 'First',
+          token: 'token_first',
+          cookie: 'cna=first-cna',
+          source: 'accounts-file'
+        };
+      }
+      if (!excluded.has('acct_second')) {
+        return {
+          accountId: 'acct_second',
+          accountName: 'Second',
+          token: 'token_second',
+          cookie: 'cna=second-cna',
+          source: 'accounts-file'
+        };
+      }
+      return null;
+    },
+    recordFailure() {},
+    invalidateAccount() {},
+    clearFailure() {},
+    clearInvalidation() {}
+  };
+
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+    if (value.endsWith('/models')) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        async json() {
+          return { data: [{ provider: 'claude', modelList: [{ modelName: 'claude-opus-4-6', visible: true }] }] };
+        }
+      };
+    }
+
+    if (value.includes('/api/entitlement/quota')) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { success: true, data: { usagePercent: 20, refreshCountdownSeconds: 3600 } };
+        }
+      };
+    }
+
+    if (value.includes('/generateContent')) {
+      const body = JSON.parse(options.body || '{}');
+      seenTokens.push(body.token);
+      if (body.token === 'token_first') {
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('data:{"error_code":"429","error_message":"quota exceeded"}\n\n'));
+              controller.close();
+            }
+          })
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data:{"content":{"parts":[{"text":"ok from retry"}]}}\n\n'));
+            controller.close();
+          }
+        })
+      };
+    }
+
+    throw new Error('Unexpected URL: ' + value);
+  };
+
+  const client = new DirectLlmClient({
+    authMode: 'file',
+    authProvider,
+    requestTimeoutMs: 1000,
+    quotaPreflightEnabled: true,
+    quotaCacheTtlMs: 30000,
+    modelsCacheTtlMs: 1000,
+    localGatewayBaseUrl: 'http://127.0.0.1:4097',
+    upstreamBaseUrl: 'https://example.test/api/adk/llm',
+    fetchImpl
+  });
+
+  const result = await client.run(
+    { model: 'claude-opus-4-6', requestBody: { model: 'claude-opus-4-6' } },
+    {
+      onDecision(event) {
+        decisions.push(event);
+      },
+      onEvent(event) {
+        events.push(event);
+      }
+    }
+  );
+
+  assert.equal(result.accountId, 'acct_second');
+  assert.equal(result.finalText, 'ok from retry');
+  assert.deepEqual(seenTokens, ['token_first', 'token_second']);
+  assert.deepEqual(events, [{ type: 'text_delta', text: 'ok from retry' }]);
+  assert.ok(decisions.some((event) => event.type === 'account_failover' && event.accountId === 'acct_first' && event.phase === 'stream' && event.responseStarted === false));
+});
+
+test("DirectLlmClient does not transparently retry once stream output has started", async () => {
+  const decisions = [];
+  const events = [];
+  const seenTokens = [];
+  const authProvider = {
+    resolveCredential(options = {}) {
+      const excluded = new Set(Array.isArray(options.excludeIds) ? options.excludeIds : []);
+      if (!excluded.has('acct_first')) {
+        return {
+          accountId: 'acct_first',
+          accountName: 'First',
+          token: 'token_first',
+          cookie: 'cna=first-cna',
+          source: 'accounts-file'
+        };
+      }
+      if (!excluded.has('acct_second')) {
+        return {
+          accountId: 'acct_second',
+          accountName: 'Second',
+          token: 'token_second',
+          cookie: 'cna=second-cna',
+          source: 'accounts-file'
+        };
+      }
+      return null;
+    },
+    recordFailure() {},
+    invalidateAccount() {},
+    clearFailure() {},
+    clearInvalidation() {}
+  };
+
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+    if (value.endsWith('/models')) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        async json() {
+          return { data: [{ provider: 'claude', modelList: [{ modelName: 'claude-opus-4-6', visible: true }] }] };
+        }
+      };
+    }
+
+    if (value.includes('/api/entitlement/quota')) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { success: true, data: { usagePercent: 20, refreshCountdownSeconds: 3600 } };
+        }
+      };
+    }
+
+    if (value.includes('/generateContent')) {
+      const body = JSON.parse(options.body || '{}');
+      seenTokens.push(body.token);
+      if (body.token === 'token_first') {
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('data:{"content":{"parts":[{"text":"partial"}]}}\n\n'));
+              controller.enqueue(new TextEncoder().encode('data:{"error_code":"429","error_message":"quota exceeded"}\n\n'));
+              controller.close();
+            }
+          })
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data:{"content":{"parts":[{"text":"should not happen"}]}}\n\n'));
+            controller.close();
+          }
+        })
+      };
+    }
+
+    throw new Error('Unexpected URL: ' + value);
+  };
+
+  const client = new DirectLlmClient({
+    authMode: 'file',
+    authProvider,
+    requestTimeoutMs: 1000,
+    quotaPreflightEnabled: true,
+    quotaCacheTtlMs: 30000,
+    modelsCacheTtlMs: 1000,
+    localGatewayBaseUrl: 'http://127.0.0.1:4097',
+    upstreamBaseUrl: 'https://example.test/api/adk/llm',
+    fetchImpl
+  });
+
+  await assert.rejects(
+    () => client.run(
+      { model: 'claude-opus-4-6', requestBody: { model: 'claude-opus-4-6' } },
+      {
+        onDecision(event) {
+          decisions.push(event);
+        },
+        onEvent(event) {
+          events.push(event);
+        }
+      }
+    ),
+    (error) => {
+      assert.ok(error instanceof UpstreamSseError);
+      assert.equal(error.status, 429);
+      return true;
+    }
+  );
+
+  assert.deepEqual(seenTokens, ['token_first']);
+  assert.deepEqual(events, [{ type: 'text_delta', text: 'partial' }]);
+  assert.ok(decisions.some((event) => event.type === 'account_failover_blocked' && event.accountId === 'acct_first' && event.phase === 'stream' && event.responseStarted === true));
+});

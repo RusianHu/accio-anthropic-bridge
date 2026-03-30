@@ -1,0 +1,34 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="74" y1="54" x2="438" y2="462" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#191614"/>
+      <stop offset="0.55" stop-color="#2A211B"/>
+      <stop offset="1" stop-color="#140F0C"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="112" y1="110" x2="388" y2="402" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFD18F"/>
+      <stop offset="0.45" stop-color="#E28743"/>
+      <stop offset="1" stop-color="#8E3C1E"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="195" y1="181" x2="317" y2="336" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF4D9"/>
+      <stop offset="0.5" stop-color="#FFD78C"/>
+      <stop offset="1" stop-color="#F29A4B"/>
+    </linearGradient>
+    <filter id="glow" x="97" y="95" width="318" height="322" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+  </defs>
+  <rect x="36" y="36" width="440" height="440" rx="116" fill="url(#bg)"/>
+  <rect x="36" y="36" width="440" height="440" rx="116" stroke="rgba(255,255,255,0.06)" stroke-width="2"/>
+  <g opacity="0.24" filter="url(#glow)">
+    <path d="M256 138C310.124 138 354 181.876 354 236V278C354 332.124 310.124 376 256 376C201.876 376 158 332.124 158 278V236C158 181.876 201.876 138 256 138Z" fill="#E28743"/>
+  </g>
+  <path d="M256 110C338.843 110 406 177.157 406 260C406 342.843 338.843 410 256 410C173.157 410 106 342.843 106 260C106 177.157 173.157 110 256 110ZM256 156C198.562 156 152 202.562 152 260C152 317.438 198.562 364 256 364C313.438 364 360 317.438 360 260C360 202.562 313.438 156 256 156Z" fill="url(#ring)"/>
+  <path d="M256 170C306.81 170 348 211.19 348 262C348 312.81 306.81 354 256 354C205.19 354 164 312.81 164 262C164 211.19 205.19 170 256 170Z" fill="#211915"/>
+  <path d="M255.991 176L315 238.608L279.449 243.296L307.645 309.17L251.305 288.742L229.54 338L197.626 275.802L146 268.031L194.33 223.687L180.09 176L230.301 201.628L255.991 176Z" fill="url(#spark)"/>
+  <path d="M169 124L196.5 138" stroke="#F6C37E" stroke-width="12" stroke-linecap="round"/>
+  <path d="M340 381L366 394" stroke="#A64A26" stroke-width="10" stroke-linecap="round" opacity="0.72"/>
+  <path d="M356 143L384 117" stroke="#F0A15A" stroke-width="10" stroke-linecap="round"/>
+  <path d="M130 356L154 333" stroke="#8A3A20" stroke-width="10" stroke-linecap="round" opacity="0.76"/>
+</svg>

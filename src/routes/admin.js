@@ -8,6 +8,7 @@ const { promisify } = require("node:util");
 
 const { readJsonBody } = require("../middleware/body-parser");
 const { writeJson, CORS_HEADERS } = require("../http");
+const { parseEnvValue } = require("../env-file");
 const {
   detectActiveStorage,
   readGatewayState,
@@ -22,6 +23,96 @@ const { writeAccountToFile, findStoredAccountAuthPayload } = require("../account
 const log = require("../logger");
 
 const execFileAsync = promisify(execFile);
+
+const QUOTA_CACHE_TTL_MS = 15 * 1000;
+const quotaCache = new Map();
+function quoteEnvValue(value) {
+  const text = String(value == null ? "" : value);
+  if (!text) {
+    return "";
+  }
+
+  if (/^[A-Za-z0-9_./:@-]+$/.test(text)) {
+    return text;
+  }
+
+  return '"' + text
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n") + '"';
+}
+
+function upsertEnvValues(filePath, values) {
+  const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+  const lines = existing ? existing.split(/\r?\n/) : [];
+  const seen = new Set();
+
+  const nextLines = lines.map((line) => {
+    const index = line.indexOf("=");
+    if (index <= 0) {
+      return line;
+    }
+
+    const key = line.slice(0, index).trim();
+    if (!Object.prototype.hasOwnProperty.call(values, key)) {
+      return line;
+    }
+
+    seen.add(key);
+    return key + '=' + quoteEnvValue(values[key]);
+  });
+
+  for (const key of Object.keys(values)) {
+    if (seen.has(key)) {
+      continue;
+    }
+    nextLines.push(key + '=' + quoteEnvValue(values[key]));
+  }
+
+  fs.writeFileSync(filePath, nextLines.join("\n").replace(/\n{3,}/g, "\n\n") + "\n");
+}
+
+function getFallbackSettings(config) {
+  return {
+    baseUrl: String(config.fallbackOpenAiBaseUrl || ""),
+    apiKey: String(config.fallbackOpenAiApiKey || ""),
+    model: String(config.fallbackOpenAiModel || ""),
+    protocol: String(config.fallbackOpenAiProtocol || "openai").toLowerCase() === "anthropic" ? "anthropic" : "openai",
+    anthropicVersion: String(config.fallbackAnthropicVersion || "2023-06-01"),
+    timeoutMs: Number(config.fallbackOpenAiTimeoutMs || 60000)
+  };
+}
+
+function applyFallbackSettings(config, fallbackClient, settings) {
+  const normalized = {
+    baseUrl: String(settings.baseUrl || "").trim(),
+    apiKey: String(settings.apiKey || "").trim(),
+    model: String(settings.model || "").trim(),
+    protocol: String(settings.protocol || "openai").trim().toLowerCase() === "anthropic" ? "anthropic" : "openai",
+    anthropicVersion: String(settings.anthropicVersion || "2023-06-01").trim() || "2023-06-01",
+    timeoutMs: Number(settings.timeoutMs || 60000) || 60000
+  };
+
+  config.fallbackOpenAiBaseUrl = normalized.baseUrl;
+  config.fallbackOpenAiApiKey = normalized.apiKey;
+  config.fallbackOpenAiModel = normalized.model;
+  config.fallbackOpenAiProtocol = normalized.protocol;
+  config.fallbackAnthropicVersion = normalized.anthropicVersion;
+  config.fallbackOpenAiTimeoutMs = normalized.timeoutMs;
+
+  process.env.ACCIO_FALLBACK_OPENAI_BASE_URL = normalized.baseUrl;
+  process.env.ACCIO_FALLBACK_OPENAI_API_KEY = normalized.apiKey;
+  process.env.ACCIO_FALLBACK_OPENAI_MODEL = normalized.model;
+  process.env.ACCIO_FALLBACK_PROTOCOL = normalized.protocol;
+  process.env.ACCIO_FALLBACK_ANTHROPIC_VERSION = normalized.anthropicVersion;
+  process.env.ACCIO_FALLBACK_OPENAI_TIMEOUT_MS = String(normalized.timeoutMs);
+
+  if (fallbackClient && typeof fallbackClient.updateConfig === "function") {
+    fallbackClient.updateConfig(normalized);
+  }
+
+  return normalized;
+}
 
 function escapeHtml(value) {
   return String(value)
@@ -328,6 +419,164 @@ async function refreshAuthPayloadViaUpstream(config, authPayload, context = {}) 
   });
 
   return refreshed;
+}
+
+function buildQuotaCacheKey(alias, userId) {
+  return `${String(alias || "")}:${String(userId || "")}`;
+}
+
+function persistResolvedAuthPayload(config, alias, authPayload) {
+  if (!authPayload || !alias) {
+    return;
+  }
+
+  try {
+    writeSnapshotAuthPayload(alias, authPayload);
+    writeAccountToFile(config.accountsPath, alias, authPayload.accessToken, {
+      user: authPayload.user || null,
+      expiresAtMs: authPayload.expiresAtMs || null,
+      expiresAtRaw: authPayload.expiresAtRaw || null,
+      source: authPayload.source || "gateway-auth-callback",
+      authPayload
+    });
+  } catch (error) {
+    log.warn("persist auth payload after quota refresh failed", {
+      alias,
+      error: error && error.message ? error.message : String(error)
+    });
+  }
+}
+
+async function requestQuotaViaUpstream(config, authPayload) {
+  if (!authPayload || !authPayload.accessToken) {
+    throw new Error("Missing accessToken for quota request");
+  }
+
+  const upstreamBaseUrl = deriveUpstreamGatewayBaseUrl(config);
+  const utdid = readAccioUtdid(config);
+  const cna = extractCnaFromCookie(authPayload.cookie);
+  const url = new URL("/api/entitlement/quota", upstreamBaseUrl);
+  url.searchParams.set("accessToken", String(authPayload.accessToken));
+  url.searchParams.set("utdid", utdid);
+  url.searchParams.set("version", "0.0.0");
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "x-language": config && config.language ? String(config.language) : "zh",
+      "x-utdid": utdid,
+      "x-app-version": "0.0.0",
+      "x-os": process.platform,
+      "x-cna": cna,
+      accept: "application/json, text/plain, */*"
+    },
+    signal: AbortSignal.timeout(8000)
+  });
+  const responseText = await response.text();
+
+  let payload;
+  try {
+    payload = responseText ? JSON.parse(responseText) : {};
+  } catch (error) {
+    throw new Error(`Quota response returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  if (!response.ok || !payload || payload.success !== true || !payload.data) {
+    const message = payload && payload.message ? String(payload.message) : `HTTP ${response.status}`;
+    const error = new Error(`Quota request failed: ${message}`);
+    error.status = response.status;
+    throw error;
+  }
+
+  const usagePercent = Number(payload.data.usagePercent);
+  const refreshCountdownSeconds = Number(payload.data.refreshCountdownSeconds);
+
+  return {
+    usagePercent: Number.isFinite(usagePercent) ? Math.min(100, Math.max(0, usagePercent)) : null,
+    refreshCountdownSeconds: Number.isFinite(refreshCountdownSeconds) ? Math.max(0, Math.floor(refreshCountdownSeconds)) : null,
+    checkedAt: new Date().toISOString(),
+    source: "upstream-entitlement"
+  };
+}
+
+async function resolveSnapshotQuota(config, snapshot, authPayload) {
+  const gatewayUser = snapshot && snapshot.gatewayUser ? snapshot.gatewayUser : null;
+  const userId = gatewayUser && gatewayUser.id ? String(gatewayUser.id) : "";
+  const alias = snapshot && snapshot.alias ? String(snapshot.alias) : userId;
+  const cacheKey = buildQuotaCacheKey(alias, userId);
+  const cached = quotaCache.get(cacheKey);
+
+  if (cached && Date.now() - cached.at < QUOTA_CACHE_TTL_MS) {
+    return cached.value;
+  }
+
+  if (!authPayload || !authPayload.accessToken) {
+    const value = {
+      available: false,
+      usagePercent: null,
+      refreshCountdownSeconds: null,
+      checkedAt: new Date().toISOString(),
+      source: null,
+      error: authPayload ? "missing_access_token" : "missing_auth_payload"
+    };
+    quotaCache.set(cacheKey, { at: Date.now(), value });
+    return value;
+  }
+
+  let resolvedAuthPayload = authPayload;
+  const isExpired = resolvedAuthPayload.expiresAtMs && Number(resolvedAuthPayload.expiresAtMs) > 0 && Number(resolvedAuthPayload.expiresAtMs) <= Date.now();
+
+  if (isExpired && resolvedAuthPayload.refreshToken) {
+    resolvedAuthPayload = await refreshAuthPayloadViaUpstream(config, resolvedAuthPayload, { alias, reason: "quota_expired_token" });
+    persistResolvedAuthPayload(config, alias, resolvedAuthPayload);
+  }
+
+  try {
+    const quota = await requestQuotaViaUpstream(config, resolvedAuthPayload);
+    const value = {
+      available: true,
+      usagePercent: quota.usagePercent,
+      refreshCountdownSeconds: quota.refreshCountdownSeconds,
+      checkedAt: quota.checkedAt,
+      source: quota.source,
+      error: null
+    };
+    quotaCache.set(cacheKey, { at: Date.now(), value });
+    return value;
+  } catch (error) {
+    const status = Number(error && error.status ? error.status : 0);
+
+    if ((status === 401 || status === 403) && resolvedAuthPayload.refreshToken) {
+      try {
+        resolvedAuthPayload = await refreshAuthPayloadViaUpstream(config, resolvedAuthPayload, { alias, reason: "quota_retry_after_auth_failure" });
+        persistResolvedAuthPayload(config, alias, resolvedAuthPayload);
+        const quota = await requestQuotaViaUpstream(config, resolvedAuthPayload);
+        const value = {
+          available: true,
+          usagePercent: quota.usagePercent,
+          refreshCountdownSeconds: quota.refreshCountdownSeconds,
+          checkedAt: quota.checkedAt,
+          source: quota.source,
+          error: null
+        };
+        quotaCache.set(cacheKey, { at: Date.now(), value });
+        return value;
+      } catch (retryError) {
+        error = retryError;
+      }
+    }
+
+    const value = {
+      available: false,
+      usagePercent: null,
+      refreshCountdownSeconds: null,
+      checkedAt: new Date().toISOString(),
+      source: null,
+      error: error && error.message ? String(error.message) : String(error)
+    };
+    quotaCache.set(cacheKey, { at: Date.now(), value });
+    return value;
+  }
 }
 
 async function requestGatewayText(gatewayManager, pathname, options = {}) {
@@ -786,36 +1035,31 @@ async function restartAccioForSnapshot(config, expectedUserId, options = {}) {
 async function buildAdminState(config, authProvider) {
   const gateway = await readGatewayState(config.baseUrl);
   const storage = detectActiveStorage();
-  const snapshots = listSnapshots().map((entry) => {
-    const storedAuthPayload = !entry.hasAuthCallback
-      ? findStoredAccountAuthPayload(config.accountsPath, {
-          alias: entry.alias,
-          accountId: entry.metadata && entry.metadata.gatewayUser && entry.metadata.gatewayUser.id
-            ? String(entry.metadata.gatewayUser.id)
-            : null,
-          userId: entry.metadata && entry.metadata.gatewayUser && entry.metadata.gatewayUser.id
-            ? String(entry.metadata.gatewayUser.id)
-            : null,
-          name: entry.metadata && entry.metadata.gatewayUser && entry.metadata.gatewayUser.name
-            ? String(entry.metadata.gatewayUser.name)
-            : null
-        })
-      : null;
+  const snapshotEntries = listSnapshots().map((entry) => {
+    const resolvedAuth = resolveSnapshotAuthPayload(entry.alias, config.accountsPath);
+    const storedAuthPayload = resolvedAuth.payload;
 
     return {
-      alias: entry.alias,
-      kind: entry.kind,
-      dir: entry.dir,
-      capturedAt: entry.metadata && entry.metadata.capturedAt ? entry.metadata.capturedAt : null,
-      gatewayUser: entry.metadata && entry.metadata.gatewayUser ? entry.metadata.gatewayUser : null,
-      artifactCount: entry.metadata && Array.isArray(entry.metadata.artifacts) ? entry.metadata.artifacts.length : 0,
-      hasFullAuthState: Boolean(entry.metadata && Array.isArray(entry.metadata.artifacts) && entry.metadata.artifacts.length > 1),
-      hasStoredAuthCallback: Boolean(storedAuthPayload),
-      hasAuthCallback: Boolean(entry.hasAuthCallback || storedAuthPayload),
-      authPayloadCapturedAt: entry.authPayloadCapturedAt || (storedAuthPayload && storedAuthPayload.capturedAt ? storedAuthPayload.capturedAt : null),
-      authPayloadUser: entry.authPayloadUser || (storedAuthPayload && storedAuthPayload.user ? storedAuthPayload.user : null)
+      storedAuthPayload,
+      snapshot: {
+        alias: entry.alias,
+        kind: entry.kind,
+        dir: entry.dir,
+        capturedAt: entry.metadata && entry.metadata.capturedAt ? entry.metadata.capturedAt : null,
+        gatewayUser: entry.metadata && entry.metadata.gatewayUser ? entry.metadata.gatewayUser : null,
+        artifactCount: entry.metadata && Array.isArray(entry.metadata.artifacts) ? entry.metadata.artifacts.length : 0,
+        hasFullAuthState: Boolean(entry.metadata && Array.isArray(entry.metadata.artifacts) && entry.metadata.artifacts.length > 1),
+        hasStoredAuthCallback: Boolean(storedAuthPayload),
+        hasAuthCallback: Boolean(entry.hasAuthCallback || storedAuthPayload),
+        authPayloadCapturedAt: entry.authPayloadCapturedAt || (storedAuthPayload && storedAuthPayload.capturedAt ? storedAuthPayload.capturedAt : null),
+        authPayloadUser: entry.authPayloadUser || (storedAuthPayload && storedAuthPayload.user ? storedAuthPayload.user : null)
+      }
     };
   });
+  const snapshots = await Promise.all(snapshotEntries.map(async ({ snapshot, storedAuthPayload }) => ({
+    ...snapshot,
+    quota: await resolveSnapshotQuota(config, snapshot, storedAuthPayload)
+  })));
   const currentGatewayUserId = gateway && gateway.user && gateway.user.id ? String(gateway.user.id) : "";
   const currentSnapshots = currentGatewayUserId
     ? snapshots.filter((snapshot) => snapshot.gatewayUser && String(snapshot.gatewayUser.id || "") === currentGatewayUserId)
@@ -843,7 +1087,11 @@ async function buildAdminState(config, authProvider) {
       authMode: config.authMode,
       accountsPath: config.accountsPath,
       sessionStorePath: config.sessionStorePath,
-      appPath: config.appPath
+      appPath: config.appPath,
+      envPath: config.envPath || path.join(process.cwd(), ".env")
+    },
+    settings: {
+      fallbackOpenAi: getFallbackSettings(config)
     },
     gateway,
     storage,
@@ -943,11 +1191,22 @@ button { font: inherit; cursor: pointer; }
 
 /* ── Topbar ── */
 .topbar {
-  display: flex;
-  flex-direction: row;
-  gap: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(340px, 0.95fr);
+  gap: 14px;
+  align-items: start;
+  margin-bottom: 12px;
+}
+.topbar.topbar-head {
+  margin-bottom: 0;
+}
+.topbar.topbar-compact {
+  grid-template-columns: 1fr;
+}
+.topbar.topbar-compact.statusActionsRow {
+  grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
+  gap: 16px;
   align-items: stretch;
-  margin-bottom: 10px;
 }
 .titleBlock,
 .statusCard,
@@ -960,8 +1219,8 @@ button { font: inherit; cursor: pointer; }
   -webkit-backdrop-filter: blur(12px);
 }
 .titleBlock {
-  flex: 1;
-  padding: 14px 18px;
+  min-height: 0;
+  padding: 18px 20px;
   animation: fadeSlideUp 0.4s ease-out;
 }
 .kicker {
@@ -978,8 +1237,8 @@ button { font: inherit; cursor: pointer; }
   font-weight: 600;
 }
 .titleBlock h1 {
-  margin: 8px 0 4px;
-  font-size: clamp(20px, 2.2vw, 26px);
+  margin: 10px 0 6px;
+  font-size: clamp(24px, 2.6vw, 34px);
   font-weight: 700;
   letter-spacing: -0.03em;
   line-height: 1.1;
@@ -987,16 +1246,20 @@ button { font: inherit; cursor: pointer; }
 .titleBlock p {
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.5;
-  max-width: 52ch;
+  font-size: 13px;
+  line-height: 1.55;
+  max-width: 44ch;
 }
 
 /* ── Status Card ── */
 .statusCard {
-  flex: 1;
-  padding: 12px 14px;
+  min-height: 0;
+  padding: 14px 16px;
   animation: fadeSlideUp 0.5s ease-out 0.1s both;
+}
+.statusCard.statusCard-wide {
+  width: 100%;
+  height: 100%;
 }
 .statusHeader {
   display: flex;
@@ -1051,28 +1314,28 @@ button { font: inherit; cursor: pointer; }
 .dot.bad { background: var(--bad); }
 .kv {
   display: grid;
-  grid-template-columns: 88px 1fr;
-  gap: 4px 8px;
-  margin-top: 8px;
-  font-size: 12px;
+  grid-template-columns: 110px 1fr;
+  gap: 8px 12px;
+  margin-top: 12px;
+  font-size: 13px;
 }
 .kv dt { color: var(--muted); font-weight: 500; }
 .kv dd { margin: 0; word-break: break-word; color: var(--ink-secondary); }
 
 /* ── Action Panel (topbar slot) ── */
 .actionPanel {
-  flex: 1;
-  padding: 14px 16px;
+  padding: 16px 18px;
   animation: fadeSlideUp 0.4s ease-out 0.2s both;
+  height: 100%;
 }
 
 /* ── Snapshot Panel (full-width) ── */
 .snapshotPanel {
-  padding: 14px 16px;
+  padding: 16px 18px;
   animation: fadeSlideUp 0.4s ease-out 0.25s both;
 }
 .panel {
-  padding: 14px 16px;
+  padding: 16px 18px;
   animation: fadeSlideUp 0.4s ease-out 0.15s both;
 }
 .panel h2 {
@@ -1371,6 +1634,200 @@ button { font: inherit; cursor: pointer; }
   color: var(--ink-secondary);
 }
 
+
+.pageHead {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.tabbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.9);
+  border: 1px solid var(--line);
+  box-shadow: 0 8px 18px rgba(24,22,20,0.06);
+  width: fit-content;
+  margin: 0 auto;
+  justify-self: center;
+}
+.tabBtn {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 10px 16px;
+  border-radius: 999px;
+  font: inherit;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: background 160ms ease, color 160ms ease, transform 160ms ease;
+}
+.tabBtn:hover {
+  color: var(--ink);
+  transform: translateY(-1px);
+}
+.tabBtn.active {
+  background: var(--accent);
+  color: #fff7f1;
+  box-shadow: 0 10px 20px rgba(194,90,50,0.22);
+}
+.tabPanel {
+  display: none;
+  animation: panelFade 180ms ease;
+}
+.tabPanel.active {
+  display: block;
+}
+.topbar.tabScopedHidden {
+  display: none;
+}
+@keyframes panelFade {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.settingsPanel {
+  display: grid;
+  gap: 16px;
+  max-width: 920px;
+}
+.settingsGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+.field {
+  display: grid;
+  gap: 8px;
+}
+.inputWrap {
+  position: relative;
+}
+.field.wide {
+  grid-column: 1 / -1;
+}
+.field label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink-secondary);
+  letter-spacing: 0.02em;
+}
+.field input,
+.field select {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,0.78);
+  color: var(--ink);
+  border-radius: 14px;
+  min-height: 50px;
+  padding: 12px 14px;
+  font: inherit;
+  transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+}
+.inputWrap input {
+  padding-right: 52px;
+}
+.field select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 44px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, rgba(24,22,20,0.72) 50%),
+    linear-gradient(135deg, rgba(24,22,20,0.72) 50%, transparent 50%);
+  background-position:
+    calc(100% - 22px) calc(50% - 3px),
+    calc(100% - 16px) calc(50% - 3px);
+  background-size: 6px 6px, 6px 6px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+}
+.inputToggle {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 10px;
+  background: rgba(24,22,20,0.05);
+  color: var(--muted);
+  font-size: 15px;
+  cursor: pointer;
+  transition: background 160ms ease, color 160ms ease, transform 160ms ease;
+}
+.inputToggle:hover {
+  background: rgba(24,22,20,0.08);
+  color: var(--ink);
+}
+.inputToggle:focus {
+  outline: none;
+  box-shadow: 0 0 0 4px rgba(194,90,50,0.12);
+  color: var(--ink);
+}
+.field input:focus,
+.field select:focus {
+  outline: none;
+  border-color: rgba(194,90,50,0.45);
+  box-shadow: 0 0 0 4px rgba(194,90,50,0.12);
+  background: #fff;
+}
+.fieldHint {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.settingsActions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.settingsMeta {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.miniStat {
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: rgba(255,255,255,0.72);
+  border: 1px solid var(--line);
+}
+.miniStatLabel {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.miniStatValue {
+  margin-top: 6px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink);
+}
+@media (max-width: 720px) {
+  .settingsGrid,
+  .settingsMeta {
+    grid-template-columns: 1fr;
+  }
+
+  .tabbar {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .tabBtn {
+    flex: 1;
+    text-align: center;
+  }
+}
+
 /* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -1378,9 +1835,10 @@ button { font: inherit; cursor: pointer; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(24,22,20,0.25); }
 
 /* ── Responsive ── */
-@media (max-width: 680px) {
-  .topbar {
-    flex-direction: column;
+@media (max-width: 980px) {
+  .topbar,
+  .statusActionsRow {
+    grid-template-columns: 1fr;
   }
 }
 @media (max-width: 720px) {
@@ -1397,69 +1855,200 @@ button { font: inherit; cursor: pointer; }
 </head>
 <body>
 <div class="shell">
-  <section class="topbar">
-    <div class="titleBlock">
-      <div class="kicker">\u25C6 Accio Manager</div>
-      <h1>Accio \u8D26\u53F7\u4E0E\u5FEB\u7167</h1>
-      <p>\u67E5\u770B\u7F51\u5173\u72B6\u6001\u3001\u7BA1\u7406\u591A\u8D26\u53F7\u767B\u5F55\u4E0E\u5FEB\u7167\u5207\u6362\u3002</p>
-    </div>
-    <aside class="statusCard">
-      <div class="statusHeader">
-        <div class="statusBadge"><span class="dot" id="gateway-dot"></span><span id="gateway-summary">\u6B63\u5728\u68C0\u67E5\u672C\u5730\u7F51\u5173\u72B6\u6001</span></div>
-        <button class="btn-icon" id="refresh-btn" title="\u5237\u65B0\u72B6\u6001">\u21BB</button>
+  <header class="pageHead">
+    <nav class="tabbar" aria-label="\u63A7\u5236\u53F0\u5206\u533A">
+      <button class="tabBtn active" type="button" data-tab="accounts">\u8D26\u53F7</button>
+      <button class="tabBtn" type="button" data-tab="settings">\u4E0A\u6E38\u914D\u7F6E</button>
+    </nav>
+    <section class="topbar topbar-head topbar-compact statusActionsRow" id="primary-topbar">
+      <aside class="statusCard statusCard-wide">
+        <div class="statusHeader">
+          <div class="statusBadge"><span class="dot" id="gateway-dot"></span><span id="gateway-summary">\u6B63\u5728\u68C0\u67E5\u672C\u5730\u7F51\u5173\u72B6\u6001</span></div>
+          <button class="btn-icon" id="refresh-btn" title="\u5237\u65B0\u72B6\u6001">\u21BB</button>
+        </div>
+        <dl class="kv" id="overview-kv"></dl>
+      </aside>
+      <aside class="panel actionPanel">
+        <h2>\u8D26\u53F7\u64CD\u4F5C</h2>
+        <div class="panelSub">\u65B0\u589E\u8D26\u53F7\u3001\u4FDD\u5B58\u5F53\u524D\u8D26\u53F7\u3001\u9000\u51FA Accio \u5F53\u524D\u767B\u5F55\u3002</div>
+        <div class="actionList">
+          <button class="btn primary" id="account-login-btn">\uFF0B \u6DFB\u52A0\u8D26\u53F7\u767B\u5F55</button>
+          <button class="btn" id="capture-current-btn">\u4FDD\u5B58\u5F53\u524D\u8D26\u53F7</button>
+          <button class="btn warn" id="logout-btn">\u767B\u51FA\u5F53\u524D Accio</button>
+        </div>
+        <div id="action-message" class="message info"></div>
+        <div id="current-account-note" class="note note-info" style="display:none"></div>
+      </aside>
+    </section>
+  </header>
+
+  <section class="tabPanel active" data-tab-panel="accounts">
+    <section class="panel snapshotPanel">
+      <div class="sectionHeader">
+        <div>
+          <h2>\u5DF2\u8BB0\u5F55\u8D26\u53F7</h2>
+          <div class="panelSub">\u672C\u5730\u5DF2\u4FDD\u5B58\u7684 Accio \u767B\u5F55\u8EAB\u4EFD\u3002\u201C\u5207\u6362\u201D\u4F1A\u5C1D\u8BD5\u5C06\u5B83\u8BBE\u4E3A\u5F53\u524D\u6FC0\u6D3B\u8D26\u53F7\u3002</div>
+        </div>
       </div>
-      <dl class="kv" id="overview-kv"></dl>
-    </aside>
-    <aside class="panel actionPanel">
-      <h2>\u8D26\u53F7\u64CD\u4F5C</h2>
-      <div class="panelSub">\u65B0\u589E\u8D26\u53F7\u3001\u4FDD\u5B58\u5FEB\u7167\u3001\u767B\u51FA\u5F53\u524D\u8D26\u53F7\u3002</div>
-      <div class="actionList">
-        <button class="btn primary" id="account-login-btn">\uFF0B \u6DFB\u52A0\u8D26\u53F7\u767B\u5F55</button>
-        <button class="btn" id="capture-current-btn">\u4FDD\u5B58\u5F53\u524D\u8D26\u53F7</button>
-        <button class="btn warn" id="logout-btn">\u767B\u51FA\u5F53\u524D Accio</button>
-      </div>
-      <div id="action-message" class="message info"></div>
-      <div id="current-account-note" class="note note-info" style="display:none"></div>
-    </aside>
+      <div class="list" id="snapshot-list"></div>
+    </section>
   </section>
 
-  <section class="panel snapshotPanel">
-    <div class="sectionHeader">
-      <div>
-        <h2>\u5DF2\u8BB0\u5F55\u8D26\u53F7</h2>
-        <div class="panelSub">\u672C\u673A\u5DF2\u4FDD\u5B58\u7684\u8D26\u53F7\u3002\u70B9\u51FB\u201C\u5207\u6362\u201D\u5373\u53EF\u5207\u6362\u767B\u5F55\u8EAB\u4EFD\u3002</div>
+  <section class="tabPanel" data-tab-panel="settings">
+    <section class="panel settingsPanel">
+      <div class="sectionHeader">
+        <div>
+          <h2>\u5916\u90E8\u4E0A\u6E38\u5140\u5E95</h2>
+          <div class="panelSub">\u5F53\u8D26\u53F7\u6C60\u548C\u672C\u5730\u94FE\u8DEF\u90FD\u4E0D\u53EF\u7528\u65F6\uFF0C\u53EF\u4EE5\u8F6C\u5411 OpenAI \u517C\u5BB9\u4E0A\u6E38\u6216 Anthropic Messages \u4E0A\u6E38\u3002Anthropic \u534F\u8BAE\u66F4\u9002\u5408 Claude Code \u8FD9\u7C7B\u539F\u751F\u5BA2\u6237\u7AEF\u3002</div>
+        </div>
       </div>
-    </div>
-    <div class="list" id="snapshot-list"></div>
+      <div class="settingsGrid">
+        <div class="field">
+          <label for="fallback-protocol">\u534F\u8BAE</label>
+          <select id="fallback-protocol">
+            <option value="openai">OpenAI compatible</option>
+            <option value="anthropic">Anthropic Messages</option>
+          </select>
+        </div>
+        <div class="field wide">
+          <label for="fallback-base-url">Base URL</label>
+          <input id="fallback-base-url" type="text" placeholder="https://your-upstream-host/v1" autocomplete="off" />
+          <div class="fieldHint">OpenAI \u534F\u8BAE\u901A\u5E38\u586B\u5230 /v1\uFF1BAnthropic \u534F\u8BAE\u586B\u5230\u63D0\u4F9B /messages \u7684\u6839\u524D\u7F00\uFF0C\u4F8B\u5982 https://api.anthropic.com/v1\u3002</div>
+        </div>
+        <div class="field wide">
+          <label for="fallback-api-key">API Key</label>
+          <div class="inputWrap">
+            <input id="fallback-api-key" type="password" placeholder="sk-..." autocomplete="off" autocapitalize="off" spellcheck="false" />
+            <button class="inputToggle" id="fallback-api-key-toggle" type="button" aria-label="显示 API Key" title="显示或隐藏 API Key">👁</button>
+          </div>
+          <div class="fieldHint">\u4FDD\u5B58\u540E\u4F1A\u5199\u5165 bridge \u6839\u76EE\u5F55\u7684 .env\uFF0C\u5E76\u7ACB\u5373\u66F4\u65B0\u5F53\u524D\u8FDB\u7A0B\u5185\u7684\u5140\u5E95\u5BA2\u6237\u7AEF\u3002</div>
+        </div>
+        <div class="field">
+          <label for="fallback-model">Model</label>
+          <input id="fallback-model" type="text" placeholder="gpt-4.1-mini" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="fallback-anthropic-version">Anthropic Version</label>
+          <input id="fallback-anthropic-version" type="text" placeholder="2023-06-01" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="fallback-timeout-ms">Timeout (ms)</label>
+          <input id="fallback-timeout-ms" type="number" min="1000" step="1000" placeholder="60000" />
+        </div>
+      </div>
+      <div class="settingsActions">
+        <button class="btn primary" id="save-fallback-config-btn">\u4FDD\u5B58\u5140\u5E95\u914D\u7F6E</button>
+        <button class="btn" id="test-fallback-config-btn">\u6D4B\u8BD5\u8FDE\u63A5</button>
+        <button class="btn" id="reload-fallback-config-btn">\u91CD\u65B0\u8F7D\u5165</button>
+      </div>
+      <div id="config-message" class="message info"></div>
+      <div class="settingsMeta">
+        <div class="miniStat">
+          <div class="miniStatLabel">\u5F53\u524D\u72B6\u6001</div>
+          <div class="miniStatValue" id="fallback-status">\u672A\u914D\u7F6E</div>
+        </div>
+        <div class="miniStat">
+          <div class="miniStatLabel">\u5199\u5165\u6587\u4EF6</div>
+          <div class="miniStatValue" id="fallback-env-path">.env</div>
+        </div>
+      </div>
+      <div class="sideNotes">
+        <div class="note">\u5F53 direct-llm \u548C local-ws \u90FD\u56E0 quota/auth/timeout/5xx \u7C7B\u95EE\u9898\u5931\u8D25\u65F6\uFF0Cbridge \u624D\u4F1A\u4F7F\u7528\u8FD9\u4E2A\u5140\u5E95\u4E0A\u6E38\u3002</div>
+        <div class="note">\u5982\u679C\u8FD9\u91CC\u914D\u7F6E\u7684\u662F Anthropic \u534F\u8BAE\uFF0C<code>/v1/messages</code> \u4F1A\u76F4\u63A5\u900F\u4F20\u5230\u5916\u90E8 Anthropic \u4E0A\u6E38\uFF0C\u5C3D\u91CF\u4FDD\u7559 Claude Code \u7684\u539F\u59CB\u8BF7\u6C42\u8BED\u4E49\u3002</div>
+      </div>
+    </section>
   </section>
 </div>
 <script>
 const els = {
+  primaryTopbar: document.getElementById('primary-topbar'),
   gatewayDot: document.getElementById('gateway-dot'),
   gatewaySummary: document.getElementById('gateway-summary'),
   overviewKv: document.getElementById('overview-kv'),
   snapshotList: document.getElementById('snapshot-list'),
   actionMessage: document.getElementById('action-message'),
+  configMessage: document.getElementById('config-message'),
   currentAccountNote: document.getElementById('current-account-note'),
   refreshBtn: document.getElementById('refresh-btn'),
   logoutBtn: document.getElementById('logout-btn'),
   accountLoginBtn: document.getElementById('account-login-btn'),
-  snapshotBtn: document.getElementById('capture-current-btn')
+  snapshotBtn: document.getElementById('capture-current-btn'),
+  saveFallbackConfigBtn: document.getElementById('save-fallback-config-btn'),
+  testFallbackConfigBtn: document.getElementById('test-fallback-config-btn'),
+  reloadFallbackConfigBtn: document.getElementById('reload-fallback-config-btn'),
+  fallbackProtocol: document.getElementById('fallback-protocol'),
+  fallbackBaseUrl: document.getElementById('fallback-base-url'),
+  fallbackApiKey: document.getElementById('fallback-api-key'),
+  fallbackApiKeyToggle: document.getElementById('fallback-api-key-toggle'),
+  fallbackModel: document.getElementById('fallback-model'),
+  fallbackAnthropicVersion: document.getElementById('fallback-anthropic-version'),
+  fallbackTimeoutMs: document.getElementById('fallback-timeout-ms'),
+  fallbackStatus: document.getElementById('fallback-status'),
+  fallbackEnvPath: document.getElementById('fallback-env-path')
 };
+const tabButtons = Array.from(document.querySelectorAll('[data-tab]'));
+const tabPanels = Array.from(document.querySelectorAll('[data-tab-panel]'));
 const desktopBridge = typeof window !== 'undefined' && window.accioBridgeDesktop ? window.accioBridgeDesktop : null;
 const isElectronShell = String(navigator.userAgent || '').includes('Electron/') || Boolean(desktopBridge);
 let messageTimer = null;
-const MSG_ICONS = { info: '\u2139\uFE0F', ok: '\u2705', warn: '\u26A0\uFE0F', error: '\u274C' };
+let configMessageTimer = null;
+const MSG_ICONS = { info: 'ℹ️', ok: '✅', warn: '⚠️', error: '❌' };
+function setScopedMessage(target, type, text, scope) {
+  if (!target) {
+    return;
+  }
+
+  if (scope === 'config') {
+    if (configMessageTimer) { clearTimeout(configMessageTimer); configMessageTimer = null; }
+  } else if (messageTimer) {
+    clearTimeout(messageTimer);
+    messageTimer = null;
+  }
+
+  target.className = 'message show ' + type;
+  target.innerHTML = '<span class="msg-icon">' + (MSG_ICONS[type] || '') + '</span><span class="msg-text">' + text + '</span><button class="msg-close" onclick="' + (scope === 'config' ? 'clearConfigMessage()' : 'clearMessage()') + '">×</button>';
+  if (type === 'ok') {
+    const timer = setTimeout(function() { scope === 'config' ? clearConfigMessage() : clearMessage(); }, 6000);
+    if (scope === 'config') {
+      configMessageTimer = timer;
+    } else {
+      messageTimer = timer;
+    }
+  }
+}
 function setMessage(type, text) {
-  if (messageTimer) { clearTimeout(messageTimer); messageTimer = null; }
-  els.actionMessage.className = 'message show ' + type;
-  els.actionMessage.innerHTML = '<span class="msg-icon">' + (MSG_ICONS[type] || '') + '</span><span class="msg-text">' + text + '</span><button class="msg-close" onclick="clearMessage()">\u00D7</button>';
-  if (type === 'ok') { messageTimer = setTimeout(function() { clearMessage(); }, 6000); }
+  setScopedMessage(els.actionMessage, type, text, 'action');
 }
 function clearMessage() {
   if (messageTimer) { clearTimeout(messageTimer); messageTimer = null; }
   els.actionMessage.className = 'message info';
   els.actionMessage.innerHTML = '';
+}
+function setConfigMessage(type, text) {
+  setScopedMessage(els.configMessage, type, text, 'config');
+}
+function clearConfigMessage() {
+  if (configMessageTimer) { clearTimeout(configMessageTimer); configMessageTimer = null; }
+  if (!els.configMessage) {
+    return;
+  }
+  els.configMessage.className = 'message info';
+  els.configMessage.innerHTML = '';
+}
+function switchTab(tab) {
+  const active = tab === 'settings' ? 'settings' : 'accounts';
+  tabButtons.forEach((button) => {
+    button.classList.toggle('active', button.getAttribute('data-tab') === active);
+  });
+  tabPanels.forEach((panel) => {
+    panel.classList.toggle('active', panel.getAttribute('data-tab-panel') === active);
+  });
+  if (els.primaryTopbar) {
+    const hideTopbar = active === 'settings';
+    els.primaryTopbar.classList.toggle('tabScopedHidden', hideTopbar);
+    els.primaryTopbar.setAttribute('aria-hidden', hideTopbar ? 'true' : 'false');
+  }
+  try { localStorage.setItem('accio-admin-tab', active); } catch (_) {}
 }
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -1526,11 +2115,44 @@ function renderCurrentAccountNote(data) {
   if (els.snapshotBtn) els.snapshotBtn.textContent = '补全当前账号';
   showNote('旧式快照 ' + currentSnapshot.alias + '，建议重新走"添加账号登录"补齐完整凭证。');
 }
+function formatCountdown(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value < 0) {
+    return '未知';
+  }
+
+  const total = Math.floor(value);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+
+  if (hours > 0) {
+    return minutes > 0 ? (hours + ' 小时 ' + minutes + ' 分钟') : (hours + ' 小时');
+  }
+
+  return minutes > 0 ? (minutes + ' 分钟') : (total + ' 秒');
+}
+function renderSettings(data) {
+  const settings = data && data.settings && data.settings.fallbackOpenAi ? data.settings.fallbackOpenAi : {};
+  const configured = Boolean(settings.baseUrl && settings.apiKey && settings.model);
+  const protocol = settings.protocol === 'anthropic' ? 'anthropic' : 'openai';
+
+  if (els.fallbackProtocol) els.fallbackProtocol.value = protocol;
+  if (els.fallbackBaseUrl) els.fallbackBaseUrl.value = settings.baseUrl || '';
+  if (els.fallbackApiKey) els.fallbackApiKey.value = settings.apiKey || '';
+  if (els.fallbackModel) els.fallbackModel.value = settings.model || '';
+  if (els.fallbackAnthropicVersion) els.fallbackAnthropicVersion.value = settings.anthropicVersion || '2023-06-01';
+  if (els.fallbackTimeoutMs) els.fallbackTimeoutMs.value = settings.timeoutMs ? String(settings.timeoutMs) : '60000';
+  if (els.fallbackStatus) els.fallbackStatus.textContent = configured
+    ? ('已配置 · ' + (protocol === 'anthropic' ? 'Anthropic' : 'OpenAI') + ' · ' + (settings.model || 'external-upstream'))
+    : '未配置';
+  if (els.fallbackEnvPath) els.fallbackEnvPath.textContent = data && data.bridge && data.bridge.envPath ? data.bridge.envPath : '.env';
+}
+
 function renderSnapshots(data) {
   const snapshots = data.snapshots || [];
   const currentUserId = data.gateway && data.gateway.user && data.gateway.user.id ? String(data.gateway.user.id) : '';
   if (snapshots.length === 0) {
-    els.snapshotList.innerHTML = '<div class="empty"><span class="empty-icon">\uD83D\uDCCB</span>还没有已记录账号。点击左侧"添加账号登录"完成第一个 Accio 登录吧！</div>';
+    els.snapshotList.innerHTML = '<div class="empty"><span class="empty-icon">📋</span>还没有已记录账号。点击左侧"添加账号登录"完成第一个 Accio 登录吧！</div>';
     return;
   }
 
@@ -1545,6 +2167,13 @@ function renderSnapshots(data) {
     const statusPill = item.hasFullAuthState && item.hasAuthCallback
       ? '<span class="pill current">完整</span>'
       : (!item.hasFullAuthState ? '<span class="pill warn">旧快照</span>' : '<span class="pill warn">仅文件</span>');
+    const quota = item.quota || null;
+    const quotaStatus = quota && quota.available && typeof quota.usagePercent === 'number'
+      ? ('已用 ' + Math.round(quota.usagePercent) + '%')
+      : (quota && quota.error === 'missing_auth_payload' ? '未知（缺少完整凭证）' : '未知');
+    const refreshStatus = quota && quota.available && typeof quota.refreshCountdownSeconds === 'number'
+      ? formatCountdown(quota.refreshCountdownSeconds)
+      : '未知';
     return '<div class="' + itemClass + '">'
       + '<div class="itemAvatar">' + avatarChar + '</div>'
       + '<div class="itemTitleRow">'
@@ -1555,6 +2184,8 @@ function renderSnapshots(data) {
       + (subLabel ? '<div class="itemMeta">' + subLabel + '</div>' : '')
       + '<div class="itemMeta">' + item.alias + '</div>'
       + '<div class="itemMeta">' + formatTime(item.capturedAt) + ' &middot; ' + String(item.artifactCount || 0) + ' 个文件</div>'
+      + '<div class="itemMeta">额度状态：' + quotaStatus + '</div>'
+      + '<div class="itemMeta">刷新时间：' + refreshStatus + '</div>'
       + (!item.hasFullAuthState ? '<div class="itemMeta hint">旧格式快照，建议重新登录</div>' : '')
       + (!item.hasAuthCallback ? '<div class="itemMeta hint">缺少原生回调，建议重新登录</div>' : '')
       + '<div class="itemSpacer"></div>'
@@ -1576,6 +2207,7 @@ function renderState(data) {
   ]);
   renderCurrentAccountNote(data);
   renderSnapshots(data);
+  renderSettings(data);
 }
 async function refreshState(message) {
   const payload = await api('/admin/api/state');
@@ -1694,6 +2326,12 @@ async function observeAccountLogin(flowId) {
   }
 }
 
+tabButtons.forEach((button) => {
+  button.addEventListener('click', () => {
+    switchTab(button.getAttribute('data-tab'));
+  });
+});
+
 els.refreshBtn.addEventListener('click', async () => {
   els.refreshBtn.classList.add('spinning');
   clearMessage();
@@ -1794,6 +2432,75 @@ document.addEventListener('click', async (event) => {
     }
   }, 3000);
 });
+if (els.saveFallbackConfigBtn) {
+  els.saveFallbackConfigBtn.addEventListener('click', () => withAction(els.saveFallbackConfigBtn, async () => {
+    clearConfigMessage();
+    const payload = await api('/admin/api/config', {
+      method: 'POST',
+      body: {
+        fallbackOpenAi: {
+          protocol: els.fallbackProtocol ? els.fallbackProtocol.value : 'openai',
+          baseUrl: els.fallbackBaseUrl ? els.fallbackBaseUrl.value.trim() : '',
+          apiKey: els.fallbackApiKey ? els.fallbackApiKey.value.trim() : '',
+          model: els.fallbackModel ? els.fallbackModel.value.trim() : '',
+          anthropicVersion: els.fallbackAnthropicVersion ? els.fallbackAnthropicVersion.value.trim() : '2023-06-01',
+          timeoutMs: els.fallbackTimeoutMs ? Number(els.fallbackTimeoutMs.value || 60000) : 60000
+        }
+      }
+    });
+    renderSettings({ settings: payload.settings, bridge: payload.bridge });
+    setConfigMessage('ok', '外部上游兜底配置已保存并立即生效。');
+  }));
+}
+
+if (els.testFallbackConfigBtn) {
+  els.testFallbackConfigBtn.addEventListener('click', () => withAction(els.testFallbackConfigBtn, async () => {
+    clearConfigMessage();
+    const payload = await api('/admin/api/config/test', {
+      method: 'POST',
+      body: {
+        fallbackOpenAi: {
+          protocol: els.fallbackProtocol ? els.fallbackProtocol.value : 'openai',
+          baseUrl: els.fallbackBaseUrl ? els.fallbackBaseUrl.value.trim() : '',
+          apiKey: els.fallbackApiKey ? els.fallbackApiKey.value.trim() : '',
+          model: els.fallbackModel ? els.fallbackModel.value.trim() : '',
+          anthropicVersion: els.fallbackAnthropicVersion ? els.fallbackAnthropicVersion.value.trim() : '2023-06-01',
+          timeoutMs: els.fallbackTimeoutMs ? Number(els.fallbackTimeoutMs.value || 60000) : 60000
+        }
+      }
+    });
+
+    const result = payload && payload.result ? payload.result : {};
+    const preview = result.preview ? ('，返回预览：' + String(result.preview).slice(0, 80)) : '';
+    setConfigMessage('ok', '连接成功：' + (result.protocol || 'unknown') + ' · ' + (result.model || 'unknown') + preview);
+  }));
+}
+
+if (els.reloadFallbackConfigBtn) {
+  els.reloadFallbackConfigBtn.addEventListener('click', () => withAction(els.reloadFallbackConfigBtn, async () => {
+    clearConfigMessage();
+    const payload = await api('/admin/api/config');
+    renderSettings({ settings: payload.settings, bridge: payload.bridge });
+    setConfigMessage('info', '已重新载入当前兜底配置。');
+  }));
+}
+
+if (els.fallbackApiKeyToggle && els.fallbackApiKey) {
+  els.fallbackApiKeyToggle.addEventListener('click', () => {
+    const nextVisible = els.fallbackApiKey.type === 'password';
+    els.fallbackApiKey.type = nextVisible ? 'text' : 'password';
+    els.fallbackApiKeyToggle.textContent = nextVisible ? '🙈' : '👁';
+    els.fallbackApiKeyToggle.setAttribute('aria-label', nextVisible ? '隐藏 API Key' : '显示 API Key');
+    els.fallbackApiKeyToggle.setAttribute('title', nextVisible ? '隐藏 API Key' : '显示或隐藏 API Key');
+  });
+}
+
+try {
+  switchTab(localStorage.getItem('accio-admin-tab') || 'accounts');
+} catch (_) {
+  switchTab('accounts');
+}
+
 refreshState().catch((error) => setMessage('error', error.message || String(error)));
 </script>
 </body>
@@ -1807,6 +2514,115 @@ async function handleAdminPage(req, res, config) {
 
 async function handleAdminState(req, res, config, authProvider) {
   writeJson(res, 200, await buildAdminState(config, authProvider));
+}
+
+async function handleAdminConfigGet(req, res, config) {
+  writeJson(res, 200, {
+    ok: true,
+    settings: {
+      fallbackOpenAi: getFallbackSettings(config)
+    },
+    bridge: {
+      envPath: config.envPath || path.join(process.cwd(), ".env")
+    }
+  });
+}
+
+async function handleAdminConfigSave(req, res, config, fallbackClient) {
+  const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
+  const fallback = body && body.fallbackOpenAi && typeof body.fallbackOpenAi === "object"
+    ? body.fallbackOpenAi
+    : {};
+
+  const nextSettings = applyFallbackSettings(config, fallbackClient, {
+    protocol: fallback.protocol,
+    baseUrl: fallback.baseUrl,
+    apiKey: fallback.apiKey,
+    model: fallback.model,
+    anthropicVersion: fallback.anthropicVersion,
+    timeoutMs: fallback.timeoutMs
+  });
+
+  const envPath = config.envPath || path.join(process.cwd(), ".env");
+  upsertEnvValues(envPath, {
+    ACCIO_FALLBACK_OPENAI_BASE_URL: nextSettings.baseUrl,
+    ACCIO_FALLBACK_OPENAI_API_KEY: nextSettings.apiKey,
+    ACCIO_FALLBACK_OPENAI_MODEL: nextSettings.model,
+    ACCIO_FALLBACK_PROTOCOL: nextSettings.protocol,
+    ACCIO_FALLBACK_ANTHROPIC_VERSION: nextSettings.anthropicVersion,
+    ACCIO_FALLBACK_OPENAI_TIMEOUT_MS: String(nextSettings.timeoutMs)
+  });
+
+  log.info("admin fallback settings updated", {
+    envPath,
+    fallbackConfigured: Boolean(nextSettings.baseUrl && nextSettings.apiKey && nextSettings.model),
+    fallbackProtocol: nextSettings.protocol,
+    fallbackModel: nextSettings.model || null
+  });
+
+  writeJson(res, 200, {
+    ok: true,
+    saved: true,
+    settings: {
+      fallbackOpenAi: nextSettings
+    },
+    bridge: {
+      envPath
+    }
+  });
+}
+
+async function handleAdminConfigTest(req, res) {
+  const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
+  const fallback = body && body.fallbackOpenAi && typeof body.fallbackOpenAi === "object"
+    ? body.fallbackOpenAi
+    : {};
+
+  const probeClient = new (require("../external-fallback").ExternalFallbackClient)({
+    protocol: fallback.protocol,
+    baseUrl: fallback.baseUrl,
+    apiKey: fallback.apiKey,
+    model: fallback.model,
+    anthropicVersion: fallback.anthropicVersion,
+    timeoutMs: fallback.timeoutMs,
+    fetchImpl: fetch
+  });
+
+  if (!probeClient.isConfigured()) {
+    writeJson(res, 400, {
+      ok: false,
+      error: {
+        type: "invalid_request_error",
+        message: "请先填写完整的协议、Base URL、API Key 和 Model。"
+      }
+    });
+    return;
+  }
+
+  try {
+    const result = await probeClient.probe();
+    log.info("admin fallback settings tested", {
+      fallbackProtocol: result.protocol,
+      fallbackTransport: result.transport,
+      fallbackModel: result.model || null
+    });
+
+    writeJson(res, 200, {
+      ok: true,
+      tested: true,
+      result
+    });
+  } catch (error) {
+    const status = Number(error && error.status ? error.status : 502) || 502;
+    writeJson(res, status, {
+      ok: false,
+      error: {
+        type: error && error.type ? error.type : "api_error",
+        message: error && error.message ? error.message : String(error)
+      },
+      details: error && error.details ? error.details : null
+    });
+  }
 }
 
 async function handleAdminSnapshotCreate(req, res, config) {
@@ -2320,6 +3136,9 @@ async function handleAdminAccountLoginStatus(req, res, config, url) {
 module.exports = {
   handleAdminPage,
   handleAdminState,
+  handleAdminConfigGet,
+  handleAdminConfigTest,
+  handleAdminConfigSave,
   handleAdminSnapshotCreate,
   handleAdminSnapshotActivate,
   handleAdminSnapshotDelete,

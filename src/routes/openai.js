@@ -8,6 +8,7 @@ const {
   resolveResultError,
   shouldFallbackToLocalTransport
 } = require("../errors");
+const { shouldFallbackToExternalProvider } = require("../external-fallback");
 const { writeJson } = require("../http");
 const log = require("../logger");
 const { readJsonBody } = require("../middleware/body-parser");
@@ -55,6 +56,12 @@ function cacheHeaders(state) {
   return {
     "x-accio-cache": state
   };
+}
+
+function fallbackTransportName(fallbackClient) {
+  return fallbackClient && fallbackClient.protocol === "anthropic"
+    ? "external-anthropic"
+    : "external-openai";
 }
 
 function buildOpenAiCacheKey(req, body, binding, protocol = "openai") {
@@ -320,7 +327,80 @@ async function executeOpenAiNonStreaming(body, req, client, directClient, sessio
   };
 }
 
-async function handleChatCompletionsRequest(req, res, client, directClient, sessionStore, responseCache) {
+
+async function tryExternalFallbackOpenAi(body, req, res, fallbackClient, binding, directRequest, cacheState = {}, error = null, phase = null) {
+  if (!fallbackClient || !fallbackClient.isEligibleOpenAi(body) || !shouldFallbackToExternalProvider(error)) {
+    return false;
+  }
+
+  const transport = fallbackTransportName(fallbackClient);
+
+  logRequest(req, "openai fallback to external provider", {
+    transportSelected: transport,
+    fallbackReason: error && error.message ? error.message : null,
+    phase,
+    fallbackModel: fallbackClient.model || null
+  });
+  updateTrace(req, {
+    bridge: {
+      transportSelected: transport
+    }
+  });
+
+  const created = Math.floor(Date.now() / 1000);
+  const chunkId = generateId("chatcmpl");
+  const result = await fallbackClient.completeOpenAi(body);
+  const inputTokens = estimateTokens(flattenOpenAiRequest(body));
+  const outputTokens = result.usage && Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
+    ? Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
+    : estimateTokens(result.text);
+  const promptTokens = result.usage && Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
+    ? Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
+    : inputTokens;
+  const baseHeaders = sessionHeaders({ sessionId: binding.sessionId || null });
+
+  if (body.stream === true) {
+    const writer = new OpenAiStreamWriter({
+      body,
+      res,
+      created,
+      id: chunkId,
+      sessionId: binding.sessionId || null
+    });
+    writer.ensureAssistantRole();
+    if (result.text) {
+      writer.writeContent(result.text);
+    }
+    setTraceResponse(req, res, 200, null, { stream: true, fallbackTransport: transport });
+    writer.finish("stop");
+    return true;
+  }
+
+  const responseBody = buildChatCompletionResponse(body, result.text || "", {
+    created,
+    id: chunkId,
+    inputTokens: promptTokens,
+    outputTokens,
+    sessionId: binding.sessionId || null
+  });
+
+  if (cacheState.cacheKey && cacheState.responseCache) {
+    cacheState.responseCache.set(cacheState.cacheKey, {
+      statusCode: 200,
+      body: responseBody,
+      headers: baseHeaders
+    });
+  }
+
+  setTraceResponse(req, res, 200, responseBody, {
+    cacheState: cacheState.cacheKey ? "miss" : null,
+    fallbackTransport: transport
+  });
+  writeJson(res, 200, responseBody, { ...baseHeaders, ...cacheHeaders("miss") });
+  return true;
+}
+
+async function handleChatCompletionsRequest(req, res, client, directClient, fallbackClient, sessionStore, responseCache) {
   const body = applyOpenAiDefaults(
     await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser),
     client.config
@@ -386,6 +466,12 @@ async function handleChatCompletionsRequest(req, res, client, directClient, sess
       });
 
       if (!shouldFallback) {
+        if (await tryExternalFallbackOpenAi(body, req, res, fallbackClient, binding, directRequest, {
+          cacheKey,
+          responseCache
+        }, error, "direct-llm")) {
+          return;
+        }
         throw error;
       }
     }
@@ -414,24 +500,35 @@ async function handleChatCompletionsRequest(req, res, client, directClient, sess
     return writer;
   };
 
-  const result = await executeBridgeQuery({
-    body,
-    client,
-    prompt,
-    protocol: "openai",
-    req,
-    sessionStore,
-    onEvent(event) {
-      if (!stream || event.type !== "append") {
-        return;
-      }
+  let result;
+  try {
+    result = await executeBridgeQuery({
+      body,
+      client,
+      prompt,
+      protocol: "openai",
+      req,
+      sessionStore,
+      onEvent(event) {
+        if (!stream || event.type !== "append") {
+          return;
+        }
 
-      if (event.delta) {
-        wroteContent = true;
-        getWriter().writeContent(event.delta);
+        if (event.delta) {
+          wroteContent = true;
+          getWriter().writeContent(event.delta);
+        }
       }
+    });
+  } catch (error) {
+    if (await tryExternalFallbackOpenAi(body, req, res, fallbackClient, binding, directRequest, {
+      cacheKey,
+      responseCache
+    }, error, "local-ws")) {
+      return;
     }
-  });
+    throw error;
+  }
 
   if (binding.sessionId) {
     sessionStore.merge(binding.sessionId, {
@@ -447,6 +544,13 @@ async function handleChatCompletionsRequest(req, res, client, directClient, sess
 
   if (stream) {
     if (errorCode) {
+      const logicalError = createBridgeError(Number(errorCode), errorMessage, classifyErrorType(Number(errorCode)));
+      if (await tryExternalFallbackOpenAi(body, req, res, fallbackClient, binding, directRequest, {
+        cacheKey,
+        responseCache
+      }, logicalError, "local-ws-logical")) {
+        return;
+      }
       if (!res.headersSent) {
         const errorBody = buildErrorResponse(errorMessage, classifyErrorType(Number(errorCode)));
         setTraceResponse(req, res, Number(errorCode), errorBody, { stream: true });
@@ -473,6 +577,13 @@ async function handleChatCompletionsRequest(req, res, client, directClient, sess
   }
 
   if (errorCode) {
+    const logicalError = createBridgeError(Number(errorCode), errorMessage, classifyErrorType(Number(errorCode)));
+    if (await tryExternalFallbackOpenAi(body, req, res, fallbackClient, binding, directRequest, {
+      cacheKey,
+      responseCache
+    }, logicalError, "local-ws-logical")) {
+      return;
+    }
     const errorBody = buildErrorResponse(errorMessage, classifyErrorType(Number(errorCode)));
     setTraceResponse(req, res, Number(errorCode), errorBody);
     writeJson(
@@ -512,7 +623,7 @@ async function handleChatCompletionsRequest(req, res, client, directClient, sess
   writeJson(res, 200, responseBody, { ...baseHeaders, ...cacheHeaders("miss") });
 }
 
-async function handleResponsesRequest(req, res, client, directClient, sessionStore, responseCache) {
+async function handleResponsesRequest(req, res, client, directClient, fallbackClient, sessionStore, responseCache) {
   const body = applyResponsesDefaults(
     await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser),
     client.config

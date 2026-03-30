@@ -74,6 +74,27 @@ test("AuthProvider invalidates accounts temporarily", () => {
   assert.equal(provider.resolveCredential().accountId, "acct_a");
 });
 
+test("AuthProvider invalidates account until a specific refresh time", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "accio-auth-provider-"));
+  const filePath = path.join(tempDir, "accounts.json");
+
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify({
+      strategy: "fixed",
+      accounts: [{ id: "acct_a", accessToken: "token_a", enabled: true }]
+    })
+  );
+
+  const provider = new AuthProvider({ authMode: "file", accountsPath: filePath });
+  provider.invalidateAccountUntil("acct_a", Date.now() + 60 * 1000, "quota refresh pending");
+
+  assert.equal(provider.resolveCredential(), null);
+
+  provider.invalidateAccountUntil("acct_a", Date.now() - 1000, "expired window");
+  assert.equal(provider.resolveCredential().accountId, "acct_a");
+});
+
 
 test("AuthProvider prefers activeAccount over round robin", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "accio-auth-provider-"));

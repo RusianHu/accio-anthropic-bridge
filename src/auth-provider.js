@@ -72,8 +72,12 @@ class AuthProvider {
       id,
       name: String(account.name || id),
       accessToken,
+      refreshToken: account.refreshToken ? String(account.refreshToken) : null,
+      cookie: account.cookie ? String(account.cookie) : null,
+      user: account.user && typeof account.user === "object" ? account.user : null,
       enabled: account.enabled !== false,
       expiresAt: Number(account.expiresAt || 0) || null,
+      expiresAtRaw: account.expiresAtRaw ? String(account.expiresAtRaw) : null,
       source: account.source || "file",
       priority: Number(account.priority || index + 1) || index + 1,
       authMode: account.authMode || null,
@@ -273,6 +277,11 @@ class AuthProvider {
           accountId: account.id,
           accountName: account.name,
           token: account.accessToken,
+          refreshToken: account.refreshToken || null,
+          cookie: account.cookie || null,
+          user: account.user || null,
+          expiresAt: account.expiresAt || null,
+          expiresAtRaw: account.expiresAtRaw || null,
           source: account.source,
           transportOverride: account.transportOverride || null,
           baseUrl: account.baseUrl || null
@@ -280,12 +289,20 @@ class AuthProvider {
       : null;
   }
 
-  invalidateAccount(accountId, reason = null) {
+  invalidateAccount(accountId, reason = null, untilMs = null) {
     if (!accountId) {
       return;
     }
 
-    this._invalidAccounts.set(String(accountId), Date.now() + INVALIDATION_MS);
+    if (untilMs != null && Number.isFinite(Number(untilMs)) && Number(untilMs) <= Date.now()) {
+      this._invalidAccounts.delete(String(accountId));
+      return;
+    }
+
+    const defaultUntil = Date.now() + INVALIDATION_MS;
+    const nextUntil = untilMs != null && Number.isFinite(Number(untilMs)) ? Number(untilMs) : defaultUntil;
+
+    this._invalidAccounts.set(String(accountId), nextUntil);
 
     if (reason) {
       this._lastFailures.set(String(accountId), {
@@ -293,6 +310,10 @@ class AuthProvider {
         reason: String(reason)
       });
     }
+  }
+
+  invalidateAccountUntil(accountId, untilMs, reason = null) {
+    this.invalidateAccount(accountId, reason, untilMs);
   }
 
   recordFailure(accountId, error) {

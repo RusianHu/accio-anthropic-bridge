@@ -18,6 +18,7 @@ const {
   resolveResultError,
   shouldFallbackToLocalTransport
 } = require("../errors");
+const { shouldFallbackToExternalProvider } = require("../external-fallback");
 const { CORS_HEADERS, writeJson, writeSse } = require("../http");
 const { readJsonBody } = require("../middleware/body-parser");
 const { applyAnthropicDefaults, canCacheAnthropicRequest } = require("../request-defaults");
@@ -51,6 +52,169 @@ function cacheHeaders(state) {
   return {
     "x-accio-cache": state
   };
+}
+
+function fallbackTransportName(fallbackClient) {
+  return fallbackClient && fallbackClient.protocol === "anthropic"
+    ? "external-anthropic"
+    : "external-openai";
+}
+
+function extractAnthropicPayloadText(payload) {
+  const content = Array.isArray(payload && payload.content) ? payload.content : [];
+  return content
+    .map((block) => {
+      if (!block || typeof block !== "object") {
+        return "";
+      }
+
+      if (block.type === "text") {
+        return block.text || "";
+      }
+
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function relayExternalAnthropicPassThrough(body, req, res, fallbackClient, binding, cacheState = {}, error = null, phase = null) {
+  const transport = fallbackTransportName(fallbackClient);
+
+  logRequest(req, "anthropic fallback to external provider", {
+    transportSelected: transport,
+    fallbackReason: error && error.message ? error.message : null,
+    phase,
+    fallbackModel: fallbackClient.model || null
+  });
+  updateTrace(req, {
+    bridge: {
+      transportSelected: transport
+    }
+  });
+
+  const upstream = await fallbackClient.requestAnthropicMessage(body);
+  const status = Number(upstream.status || 200);
+  const contentType = String(upstream.headers.get("content-type") || "application/json; charset=utf-8");
+  const baseHeaders = sessionHeaders({ sessionId: binding.sessionId || null });
+
+  if (body.stream === true && upstream.ok && /text\/event-stream/i.test(contentType)) {
+    logRequest(req, "anthropic external fallback streaming passthrough", {
+      transportSelected: transport,
+      upstreamContentType: contentType,
+      phase
+    });
+
+    if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+      res.writeHead(status, {
+        ...CORS_HEADERS,
+        ...baseHeaders,
+        "content-type": contentType,
+        "cache-control": upstream.headers.get("cache-control") || "no-cache",
+        connection: upstream.headers.get("connection") || "keep-alive"
+      });
+    }
+
+    setTraceResponse(req, res, status, null, {
+      stream: true,
+      fallbackTransport: transport
+    });
+
+    if (upstream.body) {
+      for await (const chunk of upstream.body) {
+        if (res.writableEnded || res.destroyed) {
+          break;
+        }
+        res.write(chunk);
+      }
+    }
+
+    if (!res.writableEnded && !res.destroyed) {
+      res.end();
+    }
+    return true;
+  }
+
+  const rawText = await upstream.text();
+  let payload = null;
+
+  if (/application\/json/i.test(contentType)) {
+    try {
+      payload = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      payload = null;
+    }
+  }
+
+  if (body.stream === true && upstream.ok && payload && typeof payload === "object") {
+    const text = extractAnthropicPayloadText(payload);
+
+    logRequest(req, "anthropic external fallback synthesized sse", {
+      transportSelected: transport,
+      upstreamContentType: contentType,
+      phase,
+      upstreamMessageId: payload && payload.id ? payload.id : null,
+      synthesizedTextLength: text.length,
+      synthesizedTextPreview: text ? text.slice(0, 120) : null
+    });
+
+    const writer = new AnthropicStreamWriter({
+      estimateTokens,
+      inputTokens: Number(payload && payload.usage && payload.usage.input_tokens) || estimateTokens(flattenAnthropicRequest(body)),
+      body,
+      res,
+      id: payload && payload.id ? payload.id : generateId("msg"),
+      sessionId: binding.sessionId || null
+    });
+
+    setTraceResponse(req, res, status, null, {
+      stream: true,
+      fallbackTransport: transport
+    });
+
+    if (text) {
+      writer.writeTextDelta(text);
+    } else {
+      writer.start();
+    }
+
+    writer.finishEndTurn(text, Number(payload && payload.usage && payload.usage.input_tokens) || estimateTokens(flattenAnthropicRequest(body)));
+    return true;
+  }
+
+  if (upstream.ok && cacheState.cacheKey && cacheState.responseCache && payload && typeof payload === "object") {
+    cacheState.responseCache.set(cacheState.cacheKey, {
+      statusCode: status,
+      body: payload,
+      headers: baseHeaders
+    });
+  }
+
+  setTraceResponse(req, res, status, payload, {
+    cacheState: upstream.ok && cacheState.cacheKey ? "miss" : null,
+    fallbackTransport: transport
+  });
+
+  if (payload && typeof payload === "object") {
+    writeJson(res, status, payload, {
+      ...baseHeaders,
+      ...(upstream.ok ? cacheHeaders("miss") : {})
+    });
+    return true;
+  }
+
+  if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+    res.writeHead(status, {
+      ...CORS_HEADERS,
+      ...baseHeaders,
+      "content-type": contentType
+    });
+  }
+
+  if (!res.writableEnded && !res.destroyed) {
+    res.end(rawText);
+  }
+  return true;
 }
 
 function buildAnthropicCacheKey(req, body, binding) {
@@ -220,7 +384,87 @@ async function runDirectAnthropic(body, req, res, directClient, sessionStore, st
   writeJson(res, 200, responseBody, { ...baseHeaders, ...cacheHeaders("miss") });
 }
 
-async function handleMessagesRequest(req, res, client, directClient, sessionStore, responseCache) {
+
+async function tryExternalFallbackAnthropic(body, req, res, fallbackClient, binding, directRequest, cacheState = {}, error = null, phase = null) {
+  if (!fallbackClient || !fallbackClient.isEligibleAnthropic(body) || !shouldFallbackToExternalProvider(error)) {
+    return false;
+  }
+
+  if (fallbackClient.protocol === "anthropic") {
+    return relayExternalAnthropicPassThrough(body, req, res, fallbackClient, binding, cacheState, error, phase);
+  }
+
+  const transport = fallbackTransportName(fallbackClient);
+
+  logRequest(req, "anthropic fallback to external provider", {
+    transportSelected: transport,
+    fallbackReason: error && error.message ? error.message : null,
+    phase,
+    fallbackModel: fallbackClient.model || null
+  });
+  updateTrace(req, {
+    bridge: {
+      transportSelected: transport
+    }
+  });
+
+  const result = await fallbackClient.completeAnthropic(body);
+  const inputTokens = estimateTokens(flattenAnthropicRequest(body));
+  const outputTokens = result.usage && Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
+    ? Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
+    : estimateTokens(result.text);
+  const promptTokens = result.usage && Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
+    ? Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
+    : inputTokens;
+  const baseHeaders = sessionHeaders({ sessionId: binding.sessionId || null });
+
+  if (binding.sessionId) {
+    req.bridgeContext = req.bridgeContext || {};
+  }
+
+  if (body.stream === true) {
+    const writer = new AnthropicStreamWriter({
+      estimateTokens,
+      inputTokens: promptTokens,
+      body,
+      res,
+      id: generateId("msg"),
+      sessionId: binding.sessionId || null
+    });
+
+    if (result.text) {
+      writer.writeTextDelta(result.text);
+    }
+
+    setTraceResponse(req, res, 200, null, { stream: true, fallbackTransport: transport });
+    writer.finishEndTurn(result.text || "", promptTokens);
+    return true;
+  }
+
+  const responseBody = buildMessageResponse(body, result.text || "", {
+    id: generateId("msg"),
+    inputTokens: promptTokens,
+    outputTokens,
+    sessionId: binding.sessionId || null
+  });
+
+  if (cacheState.cacheKey && cacheState.responseCache) {
+    cacheState.responseCache.set(cacheState.cacheKey, {
+      statusCode: 200,
+      body: responseBody,
+      headers: baseHeaders
+    });
+  }
+
+  setTraceResponse(req, res, 200, responseBody, {
+    cacheState: cacheState.cacheKey ? "miss" : null,
+    fallbackTransport: transport
+  });
+  writeJson(res, 200, responseBody, { ...baseHeaders, ...cacheHeaders("miss") });
+  return true;
+}
+
+async function handleMessagesRequest(req, res, client, directClient, fallbackClient, sessionStore, responseCache) {
   const body = applyAnthropicDefaults(
     await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser),
     client.config
@@ -312,6 +556,12 @@ async function handleMessagesRequest(req, res, client, directClient, sessionStor
       });
 
       if (!shouldFallback) {
+        if (await tryExternalFallbackAnthropic(body, req, res, fallbackClient, binding, directRequest, {
+          cacheKey,
+          responseCache
+        }, error, "direct-llm")) {
+          return;
+        }
         throw error;
       }
     }
@@ -340,27 +590,38 @@ async function handleMessagesRequest(req, res, client, directClient, sessionStor
     return writer;
   };
 
-  const result = await executeBridgeQuery({
-    body,
-    client,
-    prompt,
-    protocol: "anthropic",
-    req,
-    sessionStore,
-    onEvent(event) {
-      if (!stream || event.type !== "append") {
-        return;
-      }
+  let result;
+  try {
+    result = await executeBridgeQuery({
+      body,
+      client,
+      prompt,
+      protocol: "anthropic",
+      req,
+      sessionStore,
+      onEvent(event) {
+        if (!stream || event.type !== "append") {
+          return;
+        }
 
-      if (!streamStarted) {
-        streamStarted = true;
-      }
+        if (!streamStarted) {
+          streamStarted = true;
+        }
 
-      if (event.delta) {
-        getWriter({ id: streamId }).writeTextDelta(event.delta);
+        if (event.delta) {
+          getWriter({ id: streamId }).writeTextDelta(event.delta);
+        }
       }
+    });
+  } catch (error) {
+    if (await tryExternalFallbackAnthropic(body, req, res, fallbackClient, binding, directRequest, {
+      cacheKey,
+      responseCache
+    }, error, "local-ws")) {
+      return;
     }
-  });
+    throw error;
+  }
 
   if (binding.sessionId) {
     sessionStore.merge(binding.sessionId, {
@@ -375,6 +636,13 @@ async function handleMessagesRequest(req, res, client, directClient, sessionStor
 
   if (stream) {
     if (errorCode) {
+      const logicalError = createBridgeError(Number(errorCode), errorMessage, classifyErrorType(Number(errorCode)));
+      if (await tryExternalFallbackAnthropic(body, req, res, fallbackClient, binding, directRequest, {
+        cacheKey,
+        responseCache
+      }, logicalError, "local-ws-logical")) {
+        return;
+      }
       if (!res.headersSent) {
         const errorBody = buildErrorResponse(errorMessage, classifyErrorType(Number(errorCode)));
         setTraceResponse(req, res, Number(errorCode), errorBody, { stream: true });
@@ -404,6 +672,13 @@ async function handleMessagesRequest(req, res, client, directClient, sessionStor
   }
 
   if (errorCode) {
+    const logicalError = createBridgeError(Number(errorCode), errorMessage, classifyErrorType(Number(errorCode)));
+    if (await tryExternalFallbackAnthropic(body, req, res, fallbackClient, binding, directRequest, {
+      cacheKey,
+      responseCache
+    }, logicalError, "local-ws-logical")) {
+      return;
+    }
     const errorBody = buildErrorResponse(errorMessage, classifyErrorType(Number(errorCode)));
     setTraceResponse(req, res, Number(errorCode), errorBody);
     writeJson(

@@ -4,7 +4,7 @@ const http = require("node:http");
 const path = require("node:path");
 const { spawn, execFile } = require("node:child_process");
 const { promisify } = require("node:util");
-const { app, BrowserWindow, Menu, dialog, shell, clipboard, ipcMain, safeStorage } = require("electron");
+const { app, BrowserWindow, Menu, dialog, shell, clipboard, ipcMain, safeStorage, nativeImage } = require("electron");
 
 const { loadEnvFile } = require("../src/env-file");
 const { createConfig } = require("../src/runtime-config");
@@ -13,6 +13,7 @@ const execFileAsync = promisify(execFile);
 const REPO_ROOT = path.resolve(__dirname, "..");
 const PRELOAD_PATH = path.join(__dirname, "preload.js");
 const ENV_PATH = path.join(REPO_ROOT, ".env");
+const DESKTOP_ICON_PATH = path.join(__dirname, "assets", "icon-512.png");
 
 loadEnvFile(ENV_PATH);
 
@@ -28,6 +29,19 @@ const START_POLL_MS = 500;
 const DESKTOP_HELPER_PORT = Number(process.env.ACCIO_DESKTOP_HELPER_PORT || bridgeConfig.desktopHelperUrl?.match(/:(\d+)(?:\/|$)/)?.[1] || 8090);
 
 let desktopCommandServer = null;
+
+function loadDesktopIcon() {
+  try {
+    const icon = nativeImage.createFromPath(DESKTOP_ICON_PATH);
+    if (!icon.isEmpty()) {
+      return icon;
+    }
+  } catch (_) {
+    // Ignore icon load failures; the desktop shell can still boot without a custom icon.
+  }
+
+  return null;
+}
 
 let mainWindow = null;
 let bridgeProcess = null;
@@ -80,6 +94,8 @@ ipcMain.handle('bridge:launch-accio', async (_event, params = {}) => {
   process.stdout.write(`[desktop] launch Accio finished via IPC: ${JSON.stringify(result)}\n`);
   return result;
 });
+
+ipcMain.handle('bridge:clipboard-read-text', async () => clipboard.readText());
 
 async function handleDesktopBridgeCommand(targetUrl) {
   const parsed = new URL(targetUrl);
@@ -421,6 +437,8 @@ async function ensureBridgeReady() {
 }
 
 function createMainWindow() {
+  const desktopIcon = loadDesktopIcon();
+
   mainWindow = new BrowserWindow({
     width: 960,
     height: 560,
@@ -430,6 +448,7 @@ function createMainWindow() {
     backgroundColor: "#f4efe8",
     title: "Accio Bridge Desktop",
     autoHideMenuBar: false,
+    ...(desktopIcon ? { icon: desktopIcon } : {}),
     webPreferences: {
       preload: PRELOAD_PATH,
       contextIsolation: true,
@@ -548,7 +567,7 @@ async function stopBridgeProcess() {
 }
 
 function buildMenuTemplate() {
-  return [
+  const template = [
     {
       label: "Bridge",
       submenu: [
@@ -591,10 +610,45 @@ function buildMenuTemplate() {
       role: "windowMenu"
     }
   ];
+
+  template.splice(1, 0, process.platform === "darwin"
+    ? {
+        label: "Edit",
+        submenu: [
+          { role: "undo" },
+          { role: "redo" },
+          { type: "separator" },
+          { role: "cut" },
+          { role: "copy" },
+          { role: "paste" },
+          { role: "pasteAndMatchStyle" },
+          { role: "delete" },
+          { role: "selectAll" }
+        ]
+      }
+    : {
+        label: "Edit",
+        submenu: [
+          { role: "undo" },
+          { role: "redo" },
+          { type: "separator" },
+          { role: "cut" },
+          { role: "copy" },
+          { role: "paste" },
+          { role: "delete" },
+          { role: "selectAll" }
+        ]
+      });
+
+  return template;
 }
 
 async function boot() {
   startDesktopCommandServer();
+  const desktopIcon = loadDesktopIcon();
+  if (desktopIcon && process.platform === "darwin" && app.dock && typeof app.dock.setIcon === "function") {
+    app.dock.setIcon(desktopIcon);
+  }
   createMainWindow();
   Menu.setApplicationMenu(Menu.buildFromTemplate(buildMenuTemplate()));
   await loadInitialShell();

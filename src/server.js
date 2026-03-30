@@ -7,6 +7,7 @@ const { AuthProvider } = require("./auth-provider");
 const { buildErrorResponse } = require("./anthropic");
 const { DebugTraceStore, setTraceError, updateTrace } = require("./debug-traces");
 const { DirectLlmClient } = require("./direct-llm");
+const { ExternalFallbackClient } = require("./external-fallback");
 const { classifyErrorType } = require("./errors");
 const { GatewayManager } = require("./gateway-manager");
 const { CORS_HEADERS, writeJson } = require("./http");
@@ -18,6 +19,9 @@ const { handleTraceDetail, handleTraceReplay, handleTracesList } = require("./ro
 const {
   handleAdminPage,
   handleAdminState,
+  handleAdminConfigGet,
+  handleAdminConfigTest,
+  handleAdminConfigSave,
   handleAdminSnapshotCreate,
   handleAdminSnapshotActivate,
   handleAdminSnapshotDelete,
@@ -58,7 +62,7 @@ function captureTrace(traceStore, req, res, requestMeta, startedAt) {
   });
 }
 
-function createServer(config, client, directClient, authProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore) {
+function createServer(config, client, directClient, fallbackClient, authProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore) {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const startTime = Date.now();
@@ -111,6 +115,9 @@ function createServer(config, client, directClient, authProvider, gatewayManager
           endpoints: [
             "GET /admin",
             "GET /admin/api/state",
+            "GET /admin/api/config",
+            "POST /admin/api/config/test",
+            "POST /admin/api/config",
             "POST /admin/api/snapshots",
             "POST /admin/api/snapshots/activate",
             "POST /admin/api/snapshots/delete",
@@ -144,6 +151,24 @@ function createServer(config, client, directClient, authProvider, gatewayManager
 
       if (req.method === "GET" && url.pathname === "/admin/api/state") {
         await handleAdminState(req, res, config, authProvider);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/admin/api/config") {
+        await handleAdminConfigGet(req, res, config);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/config") {
+        await handleAdminConfigSave(req, res, config, fallbackClient);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/config/test") {
+        await handleAdminConfigTest(req, res);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
         return;
       }
@@ -246,7 +271,7 @@ function createServer(config, client, directClient, authProvider, gatewayManager
       }
 
       if (req.method === "POST" && url.pathname === "/v1/messages") {
-        await handleMessagesRequest(req, res, client, directClient, sessionStore, responseCache);
+        await handleMessagesRequest(req, res, client, directClient, fallbackClient, sessionStore, responseCache);
         captureTrace(traceStore, req, res, requestMeta, startTime);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "anthropic" });
         return;
@@ -260,14 +285,14 @@ function createServer(config, client, directClient, authProvider, gatewayManager
       }
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-        await handleChatCompletionsRequest(req, res, client, directClient, sessionStore, responseCache);
+        await handleChatCompletionsRequest(req, res, client, directClient, fallbackClient, sessionStore, responseCache);
         captureTrace(traceStore, req, res, requestMeta, startTime);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "openai" });
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/v1/responses") {
-        await handleResponsesRequest(req, res, client, directClient, sessionStore, responseCache);
+        await handleResponsesRequest(req, res, client, directClient, fallbackClient, sessionStore, responseCache);
         captureTrace(traceStore, req, res, requestMeta, startTime);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "openai-responses" });
         return;
@@ -347,7 +372,20 @@ async function main() {
     localGatewayBaseUrl: config.baseUrl,
     requestTimeoutMs: config.requestTimeoutMs,
     upstreamBaseUrl: config.directLlmBaseUrl,
-    authCacheTtlMs: config.authCacheTtlMs
+    authCacheTtlMs: config.authCacheTtlMs,
+    quotaPreflightEnabled: config.quotaPreflightEnabled,
+    quotaCacheTtlMs: config.quotaCacheTtlMs,
+    accioHome: config.accioHome,
+    language: config.language
+  });
+  const fallbackClient = new ExternalFallbackClient({
+    baseUrl: config.fallbackOpenAiBaseUrl,
+    apiKey: config.fallbackOpenAiApiKey,
+    model: config.fallbackOpenAiModel,
+    protocol: config.fallbackOpenAiProtocol,
+    anthropicVersion: config.fallbackAnthropicVersion,
+    timeoutMs: config.fallbackOpenAiTimeoutMs,
+    fetchImpl: fetch
   });
   const sessionStore = new SessionStore(config.sessionStorePath);
   const modelsRegistry = new ModelsRegistry(config);
@@ -362,7 +400,7 @@ async function main() {
     maxStringLength: config.traceMaxBodyChars,
     sampleRate: config.traceSampleRate
   });
-  const server = createServer(config, client, directClient, authProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore);
+  const server = createServer(config, client, directClient, fallbackClient, authProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore);
 
   let shuttingDown = false;
 
