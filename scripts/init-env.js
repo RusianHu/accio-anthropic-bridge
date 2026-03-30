@@ -8,6 +8,7 @@ const path = require("node:path");
 const { URL } = require("node:url");
 
 const {
+  discoverAccioAppPath,
   discoverAccioConfig,
   discoverSessionSource,
   exists
@@ -93,12 +94,30 @@ function buildEnvFile(config) {
     `ACCIO_SOURCE_TYPE=${quoteEnvValue(config.sourceType)}`,
     `ACCIO_REQUEST_TIMEOUT_MS=${quoteEnvValue(config.requestTimeoutMs)}`,
     `ACCIO_TRANSPORT=${quoteEnvValue(config.transportMode)}`,
+    `ACCIO_AUTH_MODE=${quoteEnvValue(config.authMode)}`,
+    `ACCIO_AUTH_STRATEGY=${quoteEnvValue(config.authStrategy)}`,
+    `ACCIO_ACCOUNTS_CONFIG_PATH=${quoteEnvValue(config.accountsPath)}`,
+    `ACCIO_ACCESS_TOKEN=${quoteEnvValue(config.accessToken)}`,
+    `ACCIO_AUTH_ACCOUNT_ID=${quoteEnvValue(config.envAccountId)}`,
+    `ACCIO_ACCESS_TOKEN_EXPIRES_AT=${quoteEnvValue(config.accessTokenExpiresAt)}`,
+    `ACCIO_GATEWAY_AUTOSTART=${quoteEnvValue(config.gatewayAutostart)}`,
+    `ACCIO_APP_PATH=${quoteEnvValue(config.appPath)}`,
+    `ACCIO_GATEWAY_WAIT_MS=${quoteEnvValue(config.gatewayWaitMs)}`,
+    `ACCIO_GATEWAY_POLL_MS=${quoteEnvValue(config.gatewayPollMs)}`,
     `ACCIO_DIRECT_LLM_BASE_URL=${quoteEnvValue(config.directLlmBaseUrl)}`,
     `ACCIO_CLIENT_ID_PREFIX=${quoteEnvValue(config.clientIdPrefix)}`,
     `ACCIO_SESSION_STORE_PATH=${quoteEnvValue(config.sessionStorePath)}`,
     `ACCIO_MAX_RETRIES=${quoteEnvValue(config.maxRetries)}`,
     `ACCIO_RETRY_BASE_MS=${quoteEnvValue(config.retryBaseMs)}`,
-    `ACCIO_RETRY_MAX_DELAY_MS=${quoteEnvValue(config.retryMaxDelayMs)}`
+    `ACCIO_RETRY_MAX_DELAY_MS=${quoteEnvValue(config.retryMaxDelayMs)}`,
+    `ACCIO_MODELS_SOURCE=${quoteEnvValue(config.modelsSource)}`,
+    `ACCIO_MODELS_CACHE_TTL_MS=${quoteEnvValue(config.modelsCacheTtlMs)}`,
+    `ACCIO_MAX_BODY_BYTES=${quoteEnvValue(config.maxBodyBytes)}`,
+    `ACCIO_BODY_READ_TIMEOUT_MS=${quoteEnvValue(config.bodyReadTimeoutMs)}`,
+    `ACCIO_AUTH_CACHE_TTL_MS=${quoteEnvValue(config.authCacheTtlMs)}`,
+    `ACCIO_DEFAULT_MAX_OUTPUT_TOKENS=${quoteEnvValue(config.defaultMaxOutputTokens)}`,
+    `ACCIO_RESPONSE_CACHE_TTL_MS=${quoteEnvValue(config.responseCacheTtlMs)}`,
+    `ACCIO_RESPONSE_CACHE_MAX_ENTRIES=${quoteEnvValue(config.responseCacheMaxEntries)}`
   ];
 
   return `${lines.join("\n")}\n`;
@@ -168,6 +187,19 @@ async function main() {
     sourceType: process.env.ACCIO_SOURCE_TYPE || "im",
     requestTimeoutMs: process.env.ACCIO_REQUEST_TIMEOUT_MS || "120000",
     transportMode: process.env.ACCIO_TRANSPORT || "auto",
+    authMode: process.env.ACCIO_AUTH_MODE || "auto",
+    authStrategy: process.env.ACCIO_AUTH_STRATEGY || "round_robin",
+    accountsPath:
+      process.env.ACCIO_ACCOUNTS_CONFIG_PATH ||
+      process.env.ACCIO_ACCOUNTS_PATH ||
+      path.join(REPO_ROOT, "config", "accounts.json"),
+    accessToken: process.env.ACCIO_ACCESS_TOKEN || "",
+    envAccountId: process.env.ACCIO_AUTH_ACCOUNT_ID || "env-default",
+    accessTokenExpiresAt: process.env.ACCIO_ACCESS_TOKEN_EXPIRES_AT || "",
+    gatewayAutostart: process.env.ACCIO_GATEWAY_AUTOSTART || "1",
+    appPath: discoverAccioAppPath(process.env.ACCIO_APP_PATH || ""),
+    gatewayWaitMs: process.env.ACCIO_GATEWAY_WAIT_MS || "20000",
+    gatewayPollMs: process.env.ACCIO_GATEWAY_POLL_MS || "500",
     directLlmBaseUrl:
       process.env.ACCIO_DIRECT_LLM_BASE_URL ||
       "https://phoenix-gw.alibaba.com/api/adk/llm",
@@ -177,7 +209,15 @@ async function main() {
       path.join(REPO_ROOT, ".data", "sessions.json"),
     maxRetries: process.env.ACCIO_MAX_RETRIES || "2",
     retryBaseMs: process.env.ACCIO_RETRY_BASE_MS || "250",
-    retryMaxDelayMs: process.env.ACCIO_RETRY_MAX_DELAY_MS || "2500"
+    retryMaxDelayMs: process.env.ACCIO_RETRY_MAX_DELAY_MS || "2500",
+    modelsSource: process.env.ACCIO_MODELS_SOURCE || "static",
+    modelsCacheTtlMs: process.env.ACCIO_MODELS_CACHE_TTL_MS || "30000",
+    maxBodyBytes: process.env.ACCIO_MAX_BODY_BYTES || String(10 * 1024 * 1024),
+    bodyReadTimeoutMs: process.env.ACCIO_BODY_READ_TIMEOUT_MS || "30000",
+    authCacheTtlMs: process.env.ACCIO_AUTH_CACHE_TTL_MS || String(2 * 60 * 1000),
+    defaultMaxOutputTokens: process.env.ACCIO_DEFAULT_MAX_OUTPUT_TOKENS || "4096",
+    responseCacheTtlMs: process.env.ACCIO_RESPONSE_CACHE_TTL_MS || "10000",
+    responseCacheMaxEntries: process.env.ACCIO_RESPONSE_CACHE_MAX_ENTRIES || "128"
   };
   const content = buildEnvFile(finalConfig);
 

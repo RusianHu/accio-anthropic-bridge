@@ -5,10 +5,11 @@ const fs = require("node:fs");
 const { writeJson } = require("../http");
 const log = require("../logger");
 
-async function handleHealth(req, res, client, directClient, sessionStore) {
+async function handleHealth(req, res, client, directClient, sessionStore, modelsRegistry, responseCache, traceStore) {
   let auth = null;
   let authDebug = null;
   let directLlm = null;
+  let models = [];
 
   try {
     auth = await client.getAuthStatus();
@@ -43,6 +44,12 @@ async function handleHealth(req, res, client, directClient, sessionStore) {
     };
   }
 
+  try {
+    models = await modelsRegistry.listModels();
+  } catch (error) {
+    models = [];
+  }
+
   const storeExists = fs.existsSync(client.config.sessionStorePath);
   const storeStats = storeExists ? fs.statSync(client.config.sessionStorePath) : null;
 
@@ -51,13 +58,33 @@ async function handleHealth(req, res, client, directClient, sessionStore) {
     auth,
     authDebug,
     directLlm,
+    authProvider: directClient.authProvider ? directClient.authProvider.getSummary() : null,
+    gatewayManager: directClient.gatewayManager ? directClient.gatewayManager.getSummary() : null,
+    models: {
+      source: client.config.modelsSource,
+      count: models.length,
+      ids: models.slice(0, 20).map((model) => model.id)
+    },
+    responseCache: responseCache ? responseCache.getSummary() : null,
+    traces: traceStore ? traceStore.getSummary() : null,
     config: {
       baseUrl: client.config.baseUrl,
       directLlmBaseUrl: client.config.directLlmBaseUrl,
       agentId: client.config.agentId,
+      authMode: client.config.authMode,
+      authCacheTtlMs: client.config.authCacheTtlMs,
+      defaultMaxOutputTokens: client.config.defaultMaxOutputTokens,
+      responseCacheTtlMs: client.config.responseCacheTtlMs,
+      traceEnabled: client.config.traceEnabled,
+      traceSampleRate: client.config.traceSampleRate,
+      traceMaxEntries: client.config.traceMaxEntries,
+      gatewayAutostart: client.config.gatewayAutostart,
       transportMode: client.config.transportMode,
       workspacePath: client.config.workspacePath,
-      port: client.config.port
+      port: client.config.port,
+      maxBodyBytes: client.config.maxBodyBytes,
+      bodyReadTimeoutMs: client.config.bodyReadTimeoutMs,
+      traceDir: client.config.traceDir
     },
     discovery: {
       accioHome: client.config.accioHome,
@@ -66,9 +93,8 @@ async function handleHealth(req, res, client, directClient, sessionStore) {
       sourceChatId: client.config.sourceChatId
     },
     sessions: {
-      count: Object.keys(sessionStore.state.sessions || {}).length,
+      ...sessionStore.getSummary(),
       exists: storeExists,
-      path: client.config.sessionStorePath,
       updatedAt: storeStats ? storeStats.mtime.toISOString() : null
     }
   });
@@ -147,6 +173,7 @@ async function handleAccioAuthProbe(req, res, client, directClient) {
       hasCookie,
       hasTokenPrefix,
       rawCredentialsExposedOverHttp: true,
+      authMode: client.config.authMode,
       directAuthReuseFeasible: directLlmAvailable,
       note: directLlmAvailable
         ? "Local debug endpoints expose enough auth-bearing data to reuse the desktop login for direct /api/adk/llm calls."

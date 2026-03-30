@@ -210,6 +210,48 @@ function resolveAccioHome(preferredHome) {
   return preferredHome || process.env.ACCIO_HOME || path.join(os.homedir(), ".accio");
 }
 
+function discoverAccioAppPath(preferredPath) {
+  if (preferredPath && exists(preferredPath)) {
+    return preferredPath;
+  }
+
+  if (process.platform === "darwin") {
+    const candidates = [
+      process.env.ACCIO_APP_PATH,
+      "/Applications/Accio.app",
+      path.join(os.homedir(), "Applications", "Accio.app")
+    ].filter(Boolean);
+
+    for (const candidate of candidates) {
+      if (exists(candidate)) {
+        return candidate;
+      }
+    }
+
+    return preferredPath || "/Applications/Accio.app";
+  }
+
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || "";
+    const programFiles = process.env.ProgramFiles || "C:\\Program Files";
+    const candidates = [
+      process.env.ACCIO_APP_PATH,
+      path.join(localAppData, "Programs", "Accio", "Accio.exe"),
+      path.join(programFiles, "Accio", "Accio.exe")
+    ].filter(Boolean);
+
+    for (const candidate of candidates) {
+      if (exists(candidate)) {
+        return candidate;
+      }
+    }
+
+    return preferredPath || path.join(programFiles, "Accio", "Accio.exe");
+  }
+
+  return preferredPath || process.env.ACCIO_APP_PATH || "Accio";
+}
+
 function discoverAccountId(accioHome, preferredAccountId) {
   if (preferredAccountId) {
     return preferredAccountId;
@@ -423,6 +465,7 @@ function discoverAccioConfig(overrides = {}) {
 
 module.exports = {
   discoverAccioConfig,
+  discoverAccioAppPath,
   discoverSessionCandidates,
   discoverSessionSource,
   exists,

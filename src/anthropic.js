@@ -141,7 +141,20 @@ function estimateTokens(text) {
 
 function buildMessageResponse(body, text, extras = {}) {
   const toolCalls = Array.isArray(extras.toolCalls) ? extras.toolCalls : [];
+  const thinkingBlocks = Array.isArray(extras.thinkingBlocks) ? extras.thinkingBlocks : [];
   const content = [];
+
+  for (const thinkingBlock of thinkingBlocks) {
+    if (!thinkingBlock || thinkingBlock.type !== "thinking") {
+      continue;
+    }
+
+    content.push({
+      type: "thinking",
+      thinking: thinkingBlock.thinking || "",
+      ...(thinkingBlock.signature ? { signature: thinkingBlock.signature } : {})
+    });
+  }
 
   if (text || toolCalls.length === 0) {
     content.push({
@@ -175,7 +188,10 @@ function buildMessageResponse(body, text, extras = {}) {
     accio: {
       conversation_id: extras.conversationId || null,
       session_id: extras.sessionId || null,
-      tool_results: extras.toolResults || []
+      tool_results: extras.toolResults || [],
+      thinking_blocks: thinkingBlocks,
+      account_id: extras.accountId || null,
+      account_name: extras.accountName || null
     }
   };
 }

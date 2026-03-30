@@ -4,6 +4,9 @@ const crypto = require("node:crypto");
 
 const modelAliases = require("../config/model-aliases.json");
 
+const { shouldFailoverAccount } = require("./errors");
+const { extractGatewayModels } = require("./models");
+const { extractAccessToken } = require("./gateway-manager");
 const { normalizeRequestedModel } = require("./model");
 
 function safeJsonParse(value, fallback = null) {
@@ -14,15 +17,39 @@ function safeJsonParse(value, fallback = null) {
   }
 }
 
+const DEFAULT_PROVIDER_MODEL = "claude-opus-4-6";
+
 function mapRequestedModel(model, protocol) {
   const requested = normalizeRequestedModel(model);
-  const fallback = "claude-opus-4-6";
 
   if (!requested) {
-    return fallback;
+    return DEFAULT_PROVIDER_MODEL;
   }
 
   return modelAliases[requested] || requested;
+}
+
+function supportsThinkingForModel(model) {
+  const resolved = mapRequestedModel(model);
+  return /claude-(opus|sonnet)/i.test(String(resolved || ""));
+}
+
+function extractThinkingConfigFromAnthropic(body) {
+  if (!body || !body.thinking || body.thinking === false) {
+    return null;
+  }
+
+  if (body.thinking === true) {
+    return { type: "enabled" };
+  }
+
+  if (typeof body.thinking === "object") {
+    const type = String(body.thinking.type || "enabled");
+    const budgetTokens = Number(body.thinking.budget_tokens || body.thinking.budgetTokens || 0) || null;
+    return budgetTokens ? { type, budget_tokens: budgetTokens } : { type };
+  }
+
+  return { type: "enabled" };
 }
 
 function inferProvider(model) {
@@ -146,6 +173,87 @@ function normalizeToolResultContent(content) {
   return { result: content };
 }
 
+function toPositiveInteger(value) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number) || number <= 0) {
+    return null;
+  }
+
+  return Math.floor(number);
+}
+
+function normalizeAnthropicThinking(thinking, maxTokens) {
+  if (!thinking || typeof thinking !== "object" || thinking.type !== "enabled") {
+    return null;
+  }
+
+  const budgetTokens = toPositiveInteger(thinking.budget_tokens);
+
+  if (!budgetTokens) {
+    return null;
+  }
+
+  const maxOutputTokens = toPositiveInteger(maxTokens);
+
+  return {
+    type: "enabled",
+    budget_tokens: maxOutputTokens
+      ? Math.min(budgetTokens, Math.max(1, maxOutputTokens - 1))
+      : budgetTokens
+  };
+}
+
+function normalizeReasoningEffort(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+
+  if (normalized === "low" || normalized === "medium" || normalized === "high") {
+    return normalized;
+  }
+
+  return null;
+}
+
+function resolveOpenAiThinking(body) {
+  const directThinking = normalizeAnthropicThinking(body.thinking, body.max_tokens);
+
+  if (directThinking) {
+    return directThinking;
+  }
+
+  const reasoning = body.reasoning && typeof body.reasoning === "object" ? body.reasoning : null;
+  const effort = normalizeReasoningEffort(
+    body.reasoning_effort || (reasoning && (reasoning.effort || reasoning.level))
+  );
+
+  if (!effort) {
+    return null;
+  }
+
+  const maxOutputTokens = toPositiveInteger(body.max_tokens);
+
+  if (!maxOutputTokens) {
+    return null;
+  }
+
+  const ratioByEffort = {
+    low: 0.25,
+    medium: 0.5,
+    high: 0.8
+  };
+  let budgetTokens = Math.floor(maxOutputTokens * ratioByEffort[effort]);
+
+  budgetTokens = Math.max(128, budgetTokens);
+  budgetTokens = Math.min(budgetTokens, Math.max(1, maxOutputTokens - 1));
+
+  return budgetTokens > 0
+    ? {
+        type: "enabled",
+        budget_tokens: budgetTokens
+      }
+    : null;
+}
+
 function toAnthropicDirectParts(content, role, toolNameById) {
   const normalized = typeof content === "string" ? [{ type: "text", text: content }] : content;
   const parts = [];
@@ -195,6 +303,9 @@ function toAnthropicDirectParts(content, role, toolNameById) {
 function buildDirectRequestFromAnthropic(body) {
   const toolNameById = buildAnthropicToolNameMap(body.messages);
   const contents = [];
+  const rawThinking = extractThinkingConfigFromAnthropic(body);
+  const thinking = normalizeAnthropicThinking(rawThinking, body.max_tokens) || rawThinking;
+  const resolvedModel = mapRequestedModel(body.model, "anthropic");
 
   for (const message of Array.isArray(body.messages) ? body.messages : []) {
     const role = message && message.role === "assistant" ? "model" : "user";
@@ -207,9 +318,10 @@ function buildDirectRequestFromAnthropic(body) {
 
   return {
     protocol: "anthropic",
-    model: mapRequestedModel(body.model, "anthropic"),
+    model: resolvedModel,
+    thinking,
     requestBody: {
-      model: mapRequestedModel(body.model, "anthropic"),
+      model: resolvedModel,
       request_id: `anthropic-${Date.now()}`,
       contents,
       system_instruction: typeof body.system === "string"
@@ -223,7 +335,8 @@ function buildDirectRequestFromAnthropic(body) {
       tools: toToolDeclarations(body.tools, (tool) => tool.input_schema),
       temperature: body.temperature,
       max_output_tokens: body.max_tokens,
-      stop_sequences: Array.isArray(body.stop_sequences) ? body.stop_sequences : []
+      stop_sequences: Array.isArray(body.stop_sequences) ? body.stop_sequences : [],
+      ...(thinking ? { thinking } : {})
     }
   };
 }
@@ -312,6 +425,8 @@ function toOpenAiDirectParts(message, toolNameById) {
 function buildDirectRequestFromOpenAi(body) {
   const toolNameById = buildOpenAiToolNameMap(body.messages);
   const contents = [];
+  const resolvedModel = mapRequestedModel(body.model, "openai");
+  const thinking = resolveOpenAiThinking(body);
 
   for (const message of Array.isArray(body.messages) ? body.messages : []) {
     const role = message && message.role === "assistant" ? "model" : "user";
@@ -323,9 +438,9 @@ function buildDirectRequestFromOpenAi(body) {
 
   return {
     protocol: "openai",
-    model: mapRequestedModel(body.model, "openai"),
+    model: resolvedModel,
     requestBody: {
-      model: mapRequestedModel(body.model, "openai"),
+      model: resolvedModel,
       request_id: `openai-${Date.now()}`,
       contents,
       tools: toToolDeclarations(
@@ -338,7 +453,8 @@ function buildDirectRequestFromOpenAi(body) {
       ),
       temperature: body.temperature,
       max_output_tokens: body.max_tokens,
-      stop_sequences: Array.isArray(body.stop) ? body.stop : body.stop ? [body.stop] : []
+      stop_sequences: Array.isArray(body.stop) ? body.stop : body.stop ? [body.stop] : [],
+      ...(thinking ? { thinking } : {})
     }
   };
 }
@@ -358,9 +474,12 @@ class DirectResponseAccumulator {
     this.id = null;
     this.text = "";
     this.toolCalls = [];
+    this.thinkingBlocks = [];
     this.stopReason = null;
     this.usage = null;
     this.currentTool = null;
+    this.currentThinking = null;
+    this.error = null;
   }
 
   applyNormalizedParts(parts, onEvent) {
@@ -410,6 +529,14 @@ class DirectResponseAccumulator {
     if (raw.type === "content_block_start" && raw.content_block) {
       const block = raw.content_block;
 
+      if (block.type === "thinking") {
+        this.currentThinking = {
+          thinking: typeof block.thinking === "string" ? block.thinking : "",
+          signature: block.signature || null
+        };
+        return;
+      }
+
       if (block.type === "tool_use") {
         this.currentTool = {
           id: block.id || crypto.randomUUID(),
@@ -433,6 +560,16 @@ class DirectResponseAccumulator {
           onEvent({ type: "text_delta", text: deltaText });
         }
 
+        return;
+      }
+
+      if (raw.delta.type === "thinking_delta" && this.currentThinking) {
+        this.currentThinking.thinking += raw.delta.thinking || "";
+        return;
+      }
+
+      if (raw.delta.type === "signature_delta" && this.currentThinking) {
+        this.currentThinking.signature = raw.delta.signature || this.currentThinking.signature;
         return;
       }
 
@@ -463,6 +600,24 @@ class DirectResponseAccumulator {
       return;
     }
 
+    if (raw.type === "content_block_stop" && this.currentThinking) {
+      const thinkingBlock = {
+        type: "thinking",
+        thinking: this.currentThinking.thinking || ""
+      };
+
+      if (this.currentThinking.signature) {
+        thinkingBlock.signature = this.currentThinking.signature;
+      }
+
+      if (thinkingBlock.thinking || thinkingBlock.signature) {
+        this.thinkingBlocks.push(thinkingBlock);
+      }
+
+      this.currentThinking = null;
+      return;
+    }
+
     if (raw.type === "message_delta") {
       this.stopReason =
         (raw.delta && raw.delta.stop_reason) || this.stopReason || null;
@@ -474,6 +629,11 @@ class DirectResponseAccumulator {
   }
 
   applyFrame(frame, onEvent) {
+    if (frame && (frame.error_code || frame.error_message)) {
+      this.error = new UpstreamSseError(frame);
+      return;
+    }
+
     if (frame.id) {
       this.id = frame.id;
     }
@@ -509,6 +669,7 @@ class DirectResponseAccumulator {
       model: this.model,
       finalText: this.text,
       toolCalls: this.toolCalls,
+      thinkingBlocks: this.thinkingBlocks,
       stopReason:
         this.stopReason ||
         (this.toolCalls.length > 0 && !this.text ? "tool_use" : "end_turn"),
@@ -578,33 +739,247 @@ function sanitizeErrorText(text, token) {
   return text.replace(new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), maskToken(token));
 }
 
+function sanitizeErrorBody(value, token) {
+  if (value == null) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    return sanitizeErrorText(value, token);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeErrorBody(item, token));
+  }
+
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => {
+        const normalizedKey = String(key || "").toLowerCase();
+
+        if ((normalizedKey === "token" || normalizedKey === "accesstoken" || normalizedKey === "authorization") && typeof item === "string") {
+          return [key, maskToken(item)];
+        }
+
+        return [key, sanitizeErrorBody(item, token)];
+      })
+    );
+  }
+
+  return value;
+}
+
+function extractErrorMessage(parsed, fallback) {
+  if (!parsed || typeof parsed !== "object") {
+    return fallback;
+  }
+
+  if (parsed.error && typeof parsed.error === "object") {
+    if (typeof parsed.error.message === "string" && parsed.error.message.trim()) {
+      return parsed.error.message.trim();
+    }
+
+    if (typeof parsed.error.msg === "string" && parsed.error.msg.trim()) {
+      return parsed.error.msg.trim();
+    }
+  }
+
+  if (typeof parsed.message === "string" && parsed.message.trim()) {
+    return parsed.message.trim();
+  }
+
+  if (typeof parsed.msg === "string" && parsed.msg.trim()) {
+    return parsed.msg.trim();
+  }
+
+  return fallback;
+}
+
+function extractErrorType(parsed) {
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+
+  if (parsed.error && typeof parsed.error === "object" && typeof parsed.error.type === "string") {
+    return parsed.error.type;
+  }
+
+  if (typeof parsed.type === "string") {
+    return parsed.type;
+  }
+
+  return null;
+}
+
+function mapUpstreamErrorStatus(errorCode) {
+  const code = Number(errorCode) || 0;
+
+  if (code === 400) {
+    return 400;
+  }
+
+  if (code === 401 || code === 402 || code === 403) {
+    return 401;
+  }
+
+  if (code === 404) {
+    return 404;
+  }
+
+  if (code === 408) {
+    return 408;
+  }
+
+  if (code === 429) {
+    return 429;
+  }
+
+  if (code >= 500) {
+    return code;
+  }
+
+  return 502;
+}
+
+function classifyUpstreamSseErrorType(code, message) {
+  const normalized = String(message || "").toLowerCase();
+
+  if (code === "401" || code === "402" || code === "403" || normalized.includes("unauthorized")) {
+    return "authentication_error";
+  }
+
+  if (code === "429" || normalized.includes("rate limit")) {
+    return "rate_limit_error";
+  }
+
+  if (code === "400" || normalized.includes("invalid") || normalized.includes("bad request")) {
+    return "invalid_request_error";
+  }
+
+  if (code === "408" || normalized.includes("timeout")) {
+    return "api_timeout_error";
+  }
+
+  return "api_error";
+}
+
+class UpstreamHttpError extends Error {
+  constructor(status, statusText, bodyText, token) {
+    const parsed = safeJsonParse(bodyText, null);
+    const sanitizedParsed = sanitizeErrorBody(parsed, token);
+    const sanitizedText = sanitizeErrorText(bodyText || "", token);
+    const fallbackMessage = sanitizedText || `Direct LLM upstream request failed: ${status} ${statusText}`;
+    const message = extractErrorMessage(sanitizedParsed, fallbackMessage);
+
+    super(message);
+    this.name = "UpstreamHttpError";
+    this.status = Number(status) || 500;
+    this.statusText = statusText || "";
+    this.type = extractErrorType(sanitizedParsed) || null;
+    this.bodyText = sanitizedText;
+    this.body = sanitizedParsed || sanitizedText || null;
+    this.details = {
+      upstream: {
+        status: this.status,
+        statusText: this.statusText,
+        body: this.body
+      }
+    };
+  }
+}
+
+class UpstreamSseError extends Error {
+  constructor(frame) {
+    const code = String(frame && frame.error_code ? frame.error_code : "").trim() || null;
+    const message =
+      String(frame && frame.error_message ? frame.error_message : "").trim() ||
+      "Direct LLM upstream stream returned an error frame";
+
+    super(message);
+    this.name = "UpstreamSseError";
+    this.status = mapUpstreamErrorStatus(code);
+    this.statusText = "OK";
+    this.type = classifyUpstreamSseErrorType(code, message);
+    this.code = code;
+    this.body = frame || null;
+    this.details = {
+      upstream: {
+        status: 200,
+        statusText: "OK",
+        body: frame || null
+      }
+    };
+  }
+}
+
 class DirectLlmClient {
   constructor(config) {
     this.config = config;
+    this.authProvider = config.authProvider || null;
+    this.gatewayManager = config.gatewayManager || null;
+    this.fetchImpl = config.fetchImpl || fetch;
     this._cachedToken = null;
     this._cachedAt = 0;
-    this._cacheTtlMs = 2 * 60 * 1000; // 2 minutes
+    this._cacheTtlMs = Number(config.authCacheTtlMs || 2 * 60 * 1000);
+    this._availableModels = null;
+    this._availableModelsAt = 0;
+    this._modelsCacheTtlMs = Number(config.modelsCacheTtlMs || 30 * 1000);
   }
 
-  async getAuthToken() {
+  async getGatewayToken(options = {}) {
     if (this._cachedToken && Date.now() - this._cachedAt < this._cacheTtlMs) {
       return this._cachedToken;
     }
 
-    const res = await fetch(`${this.config.localGatewayBaseUrl}/debug/auth/ws-status`);
-    const payload = await res.json();
-    const url = payload && payload.data && payload.data.phoenix && payload.data.phoenix.url;
+    if (this.gatewayManager) {
+      const result = await this.gatewayManager.resolveAccessToken({
+        allowAutostart: options.allowAutostart !== false
+      });
 
-    if (!url) {
+      this._cachedToken = result.token;
+      this._cachedAt = Date.now();
+      return result.token;
+    }
+
+    const res = await this.fetchImpl(`${this.config.localGatewayBaseUrl}/debug/auth/ws-status`);
+    const payload = await res.json();
+    const token = extractAccessToken(payload);
+
+    if (!token) {
       this._cachedToken = null;
       throw new Error("Unable to resolve Accio access token from local gateway");
     }
 
-    const token = new URL(url).searchParams.get("accessToken");
-
     this._cachedToken = token;
     this._cachedAt = Date.now();
     return token;
+  }
+
+  async getAuthToken(options = {}) {
+    const authMode = String(this.config.authMode || "auto");
+
+    if (this.authProvider && authMode !== "gateway") {
+      const credential = this.authProvider.resolveCredential({
+        accountId: options.accountId,
+        stickyAccountId: options.stickyAccountId,
+        excludeIds: options.excludeIds
+      });
+
+      if (credential) {
+        return credential;
+      }
+
+      if (authMode === "file" || authMode === "env") {
+        throw new Error(`No usable credentials available for auth mode ${authMode}`);
+      }
+    }
+
+    return {
+      accountId: null,
+      accountName: null,
+      token: await this.getGatewayToken({ allowAutostart: options.allowAutostart !== false }),
+      source: "gateway"
+    };
   }
 
   clearTokenCache() {
@@ -612,76 +987,296 @@ class DirectLlmClient {
     this._cachedAt = 0;
   }
 
+  _isModelsCacheFresh() {
+    return this._availableModels && Date.now() - this._availableModelsAt < this._modelsCacheTtlMs;
+  }
+
+  async listAvailableModels() {
+    if (this._isModelsCacheFresh()) {
+      return this._availableModels;
+    }
+
+    const res = await this.fetchImpl(`${this.config.localGatewayBaseUrl}/models`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(Math.min(5000, Number(this.config.requestTimeoutMs || 5000)))
+    });
+
+    if (!res.ok) {
+      throw new Error(`Local gateway /models failed: ${res.status} ${res.statusText}`);
+    }
+
+    const models = extractGatewayModels(await res.json());
+    this._availableModels = new Set(models.map((item) => item.id));
+    this._availableModelsAt = Date.now();
+    return this._availableModels;
+  }
+
+  async resolveProviderModel(requestedModel) {
+    const requested = normalizeRequestedModel(requestedModel);
+    const normalized = mapRequestedModel(requestedModel);
+    let available = null;
+
+    try {
+      available = await this.listAvailableModels();
+    } catch {
+      return {
+        requestedModel: requested || null,
+        normalizedModel: normalized,
+        resolvedProviderModel: normalized || DEFAULT_PROVIDER_MODEL,
+        modelResolution: "alias"
+      };
+    }
+
+    if (!available || available.size === 0) {
+      return {
+        requestedModel: requested || null,
+        normalizedModel: normalized,
+        resolvedProviderModel: normalized || DEFAULT_PROVIDER_MODEL,
+        modelResolution: "alias"
+      };
+    }
+
+    const candidates = [];
+    if (requested) {
+      candidates.push(requested);
+    }
+    if (normalized && !candidates.includes(normalized)) {
+      candidates.push(normalized);
+    }
+
+    for (const candidate of candidates) {
+      if (available.has(candidate)) {
+        return {
+          requestedModel: requested || null,
+          normalizedModel: normalized,
+          resolvedProviderModel: candidate,
+          modelResolution: candidate === normalized ? "alias-match" : "direct-match"
+        };
+      }
+    }
+
+    return {
+      requestedModel: requested || null,
+      normalizedModel: normalized,
+      resolvedProviderModel: available.has(DEFAULT_PROVIDER_MODEL) ? DEFAULT_PROVIDER_MODEL : (normalized || DEFAULT_PROVIDER_MODEL),
+      modelResolution: "fallback"
+    };
+  }
+
   async isAvailable() {
     try {
-      return Boolean(await this.getAuthToken());
+      const auth = await this.getAuthToken({ allowAutostart: false });
+      return Boolean(auth && auth.token);
     } catch {
       return false;
     }
   }
 
   async run(request, options = {}) {
-    const token = await this.getAuthToken();
+    const explicitAccountId = options.accountId || request.accountId || null;
+    const stickyAccountId = options.stickyAccountId || null;
+    const triedAccounts = new Set();
+    let lastError = null;
+    const modelInfo = await this.resolveProviderModel(request.model);
 
-    if (!token) {
-      throw new Error("Accio access token is unavailable");
-    }
-
-    const upstreamBody = {
-      ...request.requestBody,
-      token
-    };
-    let res;
-
-    try {
-      res = await fetch(`${this.config.upstreamBaseUrl}/generateContent`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "text/event-stream"
-        },
-        body: JSON.stringify(upstreamBody),
-        signal: AbortSignal.timeout(this.config.requestTimeoutMs)
+    if (typeof options.onDecision === "function") {
+      options.onDecision({
+        type: "model_resolution",
+        requestedModel: modelInfo.requestedModel,
+        normalizedModel: modelInfo.normalizedModel,
+        resolvedProviderModel: modelInfo.resolvedProviderModel,
+        resolution: modelInfo.modelResolution
       });
-    } catch (error) {
-      // Clear cache on connection errors so next request retries auth
-      this.clearTokenCache();
-      throw error;
     }
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
+    while (true) {
+      const auth = await this.getAuthToken({
+        allowAutostart: true,
+        accountId: explicitAccountId,
+        stickyAccountId,
+        excludeIds: [...triedAccounts]
+      });
+      const token = auth && auth.token;
 
-      if (res.status === 401 || res.status === 403) {
-        this.clearTokenCache();
+      if (!token) {
+        throw new Error("Accio access token is unavailable");
       }
 
-      throw new Error(
-        `Direct LLM request failed: ${res.status} ${res.statusText}${text ? ` - ${sanitizeErrorText(text, token)}` : ""}`
-      );
-    }
-
-    if (!res.body) {
-      throw new Error("Direct LLM response has no body");
-    }
-
-    const state = new DirectResponseAccumulator(request.model);
-
-    for await (const frame of parseSseEvents(res.body)) {
-      if (!frame) {
-        continue;
+      if (typeof options.onDecision === "function") {
+        options.onDecision({
+          type: "direct_attempt",
+          accountId: auth.accountId,
+          accountName: auth.accountName || null,
+          authSource: auth.source,
+          requestedModel: modelInfo.requestedModel,
+          normalizedModel: modelInfo.normalizedModel,
+          resolvedProviderModel: modelInfo.resolvedProviderModel,
+          resolution: modelInfo.modelResolution,
+          thinking: request.thinking || null
+        });
       }
 
-      state.applyFrame(frame, options.onEvent);
+      const upstreamBody = {
+        ...request.requestBody,
+        model: modelInfo.resolvedProviderModel,
+        token
+      };
+      let res;
+
+      try {
+        res = await this.fetchImpl(`${this.config.upstreamBaseUrl}/generateContent`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "text/event-stream"
+          },
+          body: JSON.stringify(upstreamBody),
+          signal: AbortSignal.timeout(this.config.requestTimeoutMs)
+        });
+      } catch (error) {
+        if (auth.source === "gateway") {
+          this.clearTokenCache();
+        }
+
+        throw error;
+      }
+
+      if (!res.ok) {
+        const rawText = await res.text().catch(() => "");
+        const upstreamError = new UpstreamHttpError(res.status, res.statusText, rawText, token);
+
+        if (auth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
+          this.authProvider.recordFailure(auth.accountId, upstreamError);
+        }
+
+        if (
+          shouldFailoverAccount(upstreamError) &&
+          auth.accountId &&
+          this.authProvider &&
+          typeof this.authProvider.invalidateAccount === "function"
+        ) {
+          this.authProvider.invalidateAccount(auth.accountId, upstreamError.message);
+        }
+
+        if (shouldFailoverAccount(upstreamError) && !explicitAccountId && auth.accountId) {
+          triedAccounts.add(auth.accountId);
+          lastError = upstreamError;
+
+          if (typeof options.onDecision === "function") {
+            options.onDecision({
+              type: "account_failover",
+              accountId: auth.accountId,
+              accountName: auth.accountName || null,
+              reason: upstreamError.message,
+              status: upstreamError.status
+            });
+          }
+
+          const next = this.authProvider
+            ? this.authProvider.resolveCredential({ stickyAccountId, excludeIds: [...triedAccounts] })
+            : null;
+
+          if (next && !triedAccounts.has(next.accountId || "")) {
+            continue;
+          }
+
+          if (String(this.config.authMode || "auto") === "auto" && auth.source !== "gateway") {
+            continue;
+          }
+        }
+
+        throw upstreamError;
+      }
+
+      if (!res.body) {
+        throw new Error("Direct LLM response has no body");
+      }
+
+      const state = new DirectResponseAccumulator(modelInfo.resolvedProviderModel);
+
+      for await (const frame of parseSseEvents(res.body)) {
+        if (!frame) {
+          continue;
+        }
+
+        state.applyFrame(frame, options.onEvent);
+
+        if (state.error) {
+          break;
+        }
+      }
+
+      if (state.error) {
+        if (auth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
+          this.authProvider.recordFailure(auth.accountId, state.error);
+        }
+
+        if (
+          shouldFailoverAccount(state.error) &&
+          auth.accountId &&
+          this.authProvider &&
+          typeof this.authProvider.invalidateAccount === "function"
+        ) {
+          this.authProvider.invalidateAccount(auth.accountId, state.error.message);
+        }
+
+        if (shouldFailoverAccount(state.error) && !explicitAccountId && auth.accountId) {
+          triedAccounts.add(auth.accountId);
+          lastError = state.error;
+
+          if (typeof options.onDecision === "function") {
+            options.onDecision({
+              type: "account_failover",
+              accountId: auth.accountId,
+              accountName: auth.accountName || null,
+              reason: state.error.message,
+              status: state.error.status || null
+            });
+          }
+
+          const next = this.authProvider
+            ? this.authProvider.resolveCredential({ stickyAccountId, excludeIds: [...triedAccounts] })
+            : null;
+
+          if (next && !triedAccounts.has(next.accountId || "")) {
+            continue;
+          }
+        }
+
+        throw state.error;
+      }
+
+      if (auth.accountId && this.authProvider) {
+        if (typeof this.authProvider.clearFailure === "function") {
+          this.authProvider.clearFailure(auth.accountId);
+        }
+
+        if (typeof this.authProvider.clearInvalidation === "function") {
+          this.authProvider.clearInvalidation(auth.accountId);
+        }
+      }
+
+      return {
+        ...state.toResult(),
+        accountId: auth.accountId,
+        accountName: auth.accountName || null,
+        authSource: auth.source,
+        resolvedProviderModel: modelInfo.resolvedProviderModel,
+        thinking: request.thinking || null
+      };
     }
 
-    return state.toResult();
+    throw lastError;
   }
 }
 
 module.exports = {
   DirectLlmClient,
+  UpstreamHttpError,
+  UpstreamSseError,
   buildDirectRequestFromAnthropic,
   buildDirectRequestFromOpenAi,
-  mapRequestedModel
+  extractThinkingConfigFromAnthropic,
+  mapRequestedModel,
+  supportsThinkingForModel
 };

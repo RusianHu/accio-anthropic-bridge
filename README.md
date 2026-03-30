@@ -1,415 +1,36 @@
 # Accio Anthropic Bridge
 
-把 Anthropic / OpenAI 风格请求桥接到 Accio 的本地登录态和本地网关的本地代理。
+把 Anthropic / OpenAI 风格请求桥接到 Accio 本地登录态和网关的本地代理。
 
-这个仓库现在不再只是 PoC。当前默认工作模式是：
-
-- 优先直连 `https://phoenix-gw.alibaba.com/api/adk/llm`
-- 复用 Accio 桌面端当前登录态
-- 如果直连不可用，再回退到 Accio 本地 WebSocket `sendQuery`
-
-已经补上的关键能力包括：
-
-- Anthropic Messages API 可用子集
-- OpenAI Chat Completions 兼容接口
-- 会话复用
-- direct LLM tool use / tool result 映射
-- 更细的错误分类和本地重试
-- 自动发现可用的 Accio `agent/source/workspace`
-- 本地 Accio 鉴权复用探测
-- 一键环境初始化与 `.env` 自动加载
-- 请求级结构化日志
-- Node.js 内置测试覆盖
+- Anthropic Messages API + OpenAI Chat Completions + Responses 最小子集
+- 优先直连 `phoenix-gw`，回退到 Accio 本地 WebSocket
+- 多账号轮询 / failover / 本机快照管理
+- 可视化管理台 + Electron 桌面壳
 
 ## 免责申明
 
-在使用这个项目之前，请先接受下面这些边界：
-
 - 这是非官方、逆向分析得到的桥接方案，不代表 Accio、Anthropic、OpenAI 或阿里巴巴的官方立场
-- Accio 本地接口、上游网关协议、模型名、认证字段都可能随桌面端版本更新而失效，这个仓库不承诺长期稳定
-- 本项目会复用你当前机器上的 Accio 登录态；如果你把日志、调试输出、代理请求或错误堆栈暴露给他人，可能间接泄露敏感认证信息
-- 是否允许这样复用登录态、转发请求、桥接第三方协议，取决于你自己的使用场景以及相关服务条款；合规、风控、账号封禁、额度异常等风险由使用者自行承担
-- 如果你将这个项目用于牟利、收费服务、商业分发、代充能力、账号转售或其他商业化变现用途，因此引发的法律、合规、风控、封号、索赔或其他后果，均由使用者自行承担
-- 本项目仅适合本地研究、协议验证和个人实验环境，不建议在生产环境、多人共享环境或高权限账号环境直接使用
+- Accio 本地接口、上游网关协议、模型名、认证字段都可能随桌面端版本更新而失效，不承诺长期稳定
+- 本项目会复用你当前机器上的 Accio 登录态；暴露日志、调试输出、代理请求可能间接泄露认证信息
+- 是否允许这样复用登录态取决于你自己的使用场景以及相关服务条款；合规、风控、账号封禁等风险由使用者自行承担
+- 如果你将本项目用于商业用途，因此引发的后果均由使用者自行承担
+- 本项目仅适合本地研究、协议验证和个人实验环境
 - 如果你不清楚某条调用是否会触发上游计费、审计或风控，请先不要使用
 
-## 已验证链路
+## 快速开始
 
-Accio 桌面端本地暴露了两类入口：
-
-- HTTP: `http://127.0.0.1:4097`
-- WebSocket: `ws://127.0.0.1:4097/websocket/connect?clientId=...`
-
-这个代理已验证本地 gateway 链路：
-
-1. 外部进程可以直接访问 `127.0.0.1:4097`
-2. 外部进程可以直接建立 `/websocket/connect`
-3. 外部进程可以发送 `sendQuery`
-4. 可以收到 `ack` / `event.append` / `event.finished` / `channel.message.created`
-5. 请求结果会写入 Accio 本地 conversation 存储，可被代理再次读取用于补全 tool 映射
-
-## Accio 鉴权复用现状
-
-关于“能不能直接利用 Accio 的认证信息请求上游”这件事，现在结论已经从“待验证”变成了“已验证可行”。
-
-- Accio 桌面端本地网关会维护登录态，默认网关仍在 `http://127.0.0.1:4097`
-- 本地可直接访问：
-  - `GET /auth/status`
-  - `GET /auth/user`
-  - `GET /debug/auth/status`
-  - `GET /debug/auth/http-log`
-  - `GET /debug/auth/ws-status`
-  - `POST /debug/auth/refresh`
-  - `POST /debug/auth/fetch-user`
-- 本地网关还暴露了 `POST /upload`，会直接拿本地 Accio `Cookie` 转发到 `https://filebroker.accio.com/x/upload`
-- 从桌面端源码可以确认：
-  - Accio 本地确实保存 `accessToken` / `refreshToken` / `cookie`
-  - 请求 `phoenix-gw.alibaba.com` 时，会把 `accessToken` 注入 POST body
-  - 同时会从 `cookie` 里提取 `cna`，带到 `x-cna` 请求头
-  - 还会自动补 `x-utdid` / `x-language` / `x-app-version` / `x-os`
-
-更关键的是，已经做过真实请求验证：
-
-- `GET /debug/auth/ws-status` 会暴露带 `accessToken` 的上游 WebSocket URL
-- `GET /debug/auth/http-log` 会暴露带原始 `accessToken` 的上游 HTTP 请求日志
-- 外部进程已经成功直接调用：
-  - `POST https://phoenix-gw.alibaba.com/api/auth/userinfo`
-  - `POST https://phoenix-gw.alibaba.com/api/adk/llm/generateContent`
-
-也就是说，这个桥现在已经可以直接复用 Accio 桌面端当前登录态请求上游 LLM，不再只是通过本地 websocket 曲线触发。
-
-## 当前支持
-
-### Anthropic 兼容
-
-- `POST /v1/messages`
-- `POST /v1/messages/count_tokens`
-- 非流式
-- SSE 流式
-- 原生 `tool_use`
-- 原生 `tool_result` 继续对话
-- Claude 上游事件透传式 SSE
-- 响应顶层附加 `accio.*` 调试字段
-
-### OpenAI 兼容
-
-- `GET /v1/models`
-- `POST /v1/chat/completions`
-- 非流式
-- SSE 流式
-- `tools`
-- `tool_calls`
-- 响应顶层附加 `accio.*` 调试字段
-
-### 额外能力
-
-- `ACCIO_TRANSPORT=auto|direct-llm|local-ws`
-- `x-accio-session-id` / `x-session-id` 会话复用
-- `x-accio-conversation-id` 直接绑定已有 conversation
-- 自动发现 Accio 本地账号、agent、workspace、source
-- 对本地网关超时/连接失败/429/5xx 做错误分类
-- 对可重试错误做指数退避重试
-- `GET /debug/accio-auth` 本地鉴权探测
-
-## 仍然不是完整兼容
-
-当前还不是官方 Anthropic / OpenAI 的 100% 完整实现，限制包括：
-
-- 只有 Claude 族模型在 Anthropic 流式下能做到接近原生的 SSE 透传
-- OpenAI 兼容接口当前是“OpenAI 协议适配 + Claude 上游执行”，不是直接调用 OpenAI 官方模型
-- 图片 block 还没有做完整上传桥接，当前仍偏向文本 / tool use 场景
-- `x-accio-session-id` 在 direct LLM 模式下只是桥接层会话标识，不对应 Accio cloud conversation
-
-## 代理原理
-
-### 1. 为什么现在有两条执行链路
-
-当前代理支持两种后端：
-
-- `direct-llm`
-  - 直接请求 `phoenix-gw` 的 `/api/adk/llm/generateContent`
-  - 复用 Accio 桌面端本地登录态
-  - tool use / tool result 语义最完整
-- `local-ws`
-  - 通过 Accio 本地 WebSocket `sendQuery` 触发 agent
-  - 保留 Accio conversation / session 复用能力
-
-默认 `ACCIO_TRANSPORT=auto`，会先尝试 `direct-llm`，失败后再回退到 `local-ws`。
-
-### 2. direct LLM 如何工作
-
-收到 Anthropic 或 OpenAI 请求后，代理会：
-
-1. 从本地 `debug/auth/ws-status` / `debug/auth/http-log` 复用当前登录态
-2. 把 Anthropic/OpenAI 的消息、工具、tool result 转成 Accio ADK LLM 请求
-3. 直接请求 `phoenix-gw` 的 `/api/adk/llm/generateContent`
-4. 把返回的 Claude / Accio SSE 事件重新封装成 Anthropic 或 OpenAI 兼容响应
-
-### 3. WebSocket 回退模式如何工作
-
-当 direct LLM 不可用时，代理仍然可以：
-
-1. 根据 `session_id` 或 `conversation_id` 决定复用旧 conversation，或创建新 conversation
-2. 连接 Accio 本地 WebSocket
-3. 发送 `sendQuery`
-4. 收集 `append/finished`
-5. 回读 Accio 本地 conversation 文件，补全 `tool_calls` 和 `tool_results`
-
-### 4. 自动发现策略
-
-如果你不手动配置 `ACCIO_*` 变量，代理会优先选择：
-
-1. 有可用 DM/source 记录的账号
-2. 该账号下的可用 agent/profile
-3. agent 的默认 workspace
-
-这个策略比原来的硬编码强，但依然是启发式，不是官方稳定 API。
-
-## 目录结构
-
-```text
-accio-anthropic-bridge/
-  config/
-    model-aliases.json
-  .env.example
-  .gitignore
-  package.json
-  .data/
-    sessions.json
-  src/
-    accio-client.js
-    anthropic.js
-    bridge-core.js
-    direct-llm.js
-    discovery.js
-    errors.js
-    http.js
-    jsonc.js
-    logger.js
-    middleware/
-      body-parser.js
-    routes/
-      anthropic.js
-      health.js
-      openai.js
-    stream/
-      anthropic-sse.js
-      openai-sse.js
-    openai.js
-    server.js
-    session-store.js
-  test/
-    *.test.js
-```
-
-## 启动
+需要 Node.js >= 22 和本机已安装 Accio 桌面端。
 
 ```bash
-cd /Users/snow/accio-anthropic-bridge
+git clone <this-repo> && cd accio-anthropic-bridge
 npm start
 ```
 
-`npm start` 现在会先检查仓库根目录下是否已有 `.env`：
+`npm start` 会先检查是否有 `.env`：没有时自动执行 `npm run setup` 扫描本机 `~/.accio` 生成配置；已有则直接启动。
 
-- 没有 `.env` 时，自动执行一次 `npm run setup`
-- 已有 `.env` 时，直接启动，不覆盖你手工改过的配置
+默认监听 `http://127.0.0.1:8082`。
 
-`npm run setup` 和 `npm run init-env` 等价，都会自动扫描本机 `~/.accio`，生成当前机器专用的 `.env`。
-
-脚本优先级如下：
-
-1. 如果本地 Accio 网关 `http://127.0.0.1:4097` 可访问，优先读取当前登录态
-2. 如果本地网关暂时不可访问，再回退到 `~/.accio/accounts/*` 的最近活跃账号、最近 session、最近 workspace 进行推断
-
-所以大多数场景下，不需要手工填这些 `ACCIO_*` 环境变量。
-
-如果你只想预览自动发现结果、不写入文件：
-
-```bash
-npm run init-env -- --print
-```
-
-如果 `.env` 已存在，但你想重新生成：
-
-```bash
-npm run init-env -- --force
-```
-
-如果你只是想单独生成或重建 `.env`，仍然可以直接执行 `npm run setup`。
-
-可选环境变量：
-
-```bash
-ACCIO_TRANSPORT=auto
-ACCIO_DIRECT_LLM_BASE_URL=https://phoenix-gw.alibaba.com/api/adk/llm
-```
-
-如果你要调整模型别名映射，不需要改代码，直接编辑：
-
-```text
-config/model-aliases.json
-```
-
-默认监听：
-
-```text
-http://127.0.0.1:8082
-```
-
-## 本地鉴权探测
-
-桥接自身新增了一个探测端点，用来快速判断当前机器上的 Accio 本地鉴权能否复用：
-
-```bash
-curl http://127.0.0.1:8082/debug/accio-auth
-```
-
-这个接口会汇总：
-
-- 桥接访问的 Accio 本地网关地址
-- `GET /auth/status` 的结果
-- `GET /debug/auth/status` 的结果
-- 是否能直接复用登录态打上游 LLM
-
-它的目标不是导出敏感凭证，而是给你一个明确结论：
-
-- 当前有没有登录态
-- 本地网关有没有持有 auth material
-- 当前桥是否已经具备 direct LLM 复用条件
-
-## 健康检查
-
-```bash
-curl http://127.0.0.1:8082/healthz
-```
-
-返回内容里会带：
-
-- 当前使用的 `agentId`
-- 自动发现到的 `accountId/source`
-- session store 路径和计数
-- Accio 本地登录状态
-- Accio 本地 debug auth 摘要
-- direct LLM 是否可用
-
-## Anthropic 请求示例
-
-### 最简单文本请求
-
-```bash
-curl http://127.0.0.1:8082/v1/messages \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "accio-bridge",
-    "max_tokens": 256,
-    "messages": [
-      {
-        "role": "user",
-        "content": "请只回复 OK"
-      }
-    ]
-  }'
-```
-
-### 会话复用
-
-```bash
-curl http://127.0.0.1:8082/v1/messages \
-  -H 'content-type: application/json' \
-  -H 'x-accio-session-id: demo-session' \
-  -d '{
-    "model": "accio-bridge",
-    "messages": [
-      {
-        "role": "user",
-        "content": "请只回复 SECOND"
-      }
-    ]
-  }'
-```
-
-响应头会返回：
-
-- `x-accio-conversation-id`
-- `x-accio-session-id`
-
-注意：
-
-- `local-ws` 模式下，这两个值会绑定到 Accio 本地 conversation
-- `direct-llm` 模式下，`x-accio-session-id` 只是桥接层 session 复用标识
-
-### 工具映射
-
-```bash
-curl http://127.0.0.1:8082/v1/messages \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "accio-bridge",
-    "tools": [
-      {
-        "name": "shell_echo",
-        "description": "echo a string",
-        "input_schema": {
-          "type": "object",
-          "properties": {
-            "text": { "type": "string" }
-          },
-          "required": ["text"]
-        }
-      }
-    ],
-    "messages": [
-      {
-        "role": "user",
-        "content": "请在回答前先调用一个工具，然后告诉我你调用了什么。"
-      }
-    ]
-  }'
-```
-
-当前响应会带两层信息：
-
-- 标准 Anthropic `content[].tool_use`
-- 自定义 `accio.tool_results`
-
-## OpenAI 请求示例
-
-### Chat Completions
-
-```bash
-curl http://127.0.0.1:8082/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "accio-bridge",
-    "messages": [
-      {
-        "role": "user",
-        "content": "请只回复 OK"
-      }
-    ]
-  }'
-```
-
-### 复用 session
-
-```bash
-curl http://127.0.0.1:8082/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -H 'x-session-id: demo-openai' \
-  -d '{
-    "model": "accio-bridge",
-    "messages": [
-      {
-        "role": "user",
-        "content": "请只回复 OK"
-      }
-    ]
-  }'
-```
-
-## Claude Code 接入
-
-如果 Claude Code 支持自定义 Anthropic Base URL，可以直接这样连：
+### Claude Code 接入
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8082
@@ -417,88 +38,456 @@ export ANTHROPIC_API_KEY=dummy
 claude
 ```
 
-这里的 `ANTHROPIC_API_KEY` 只是为了满足某些客户端的本地校验。代理本身不校验这个值。
+`ANTHROPIC_API_KEY` 只是为了满足客户端本地校验，代理本身不校验。
+
+### 其他客户端
+
+```bash
+# Anthropic Messages
+curl http://127.0.0.1:8082/v1/messages \
+  -H 'content-type: application/json' \
+  -d '{"model":"accio-bridge","max_tokens":256,"messages":[{"role":"user","content":"请只回复 OK"}]}'
+
+# OpenAI Chat Completions
+curl http://127.0.0.1:8082/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"accio-bridge","messages":[{"role":"user","content":"请只回复 OK"}]}'
+```
+
+## 管理台
+
+浏览器打开 `http://127.0.0.1:8082/admin`，或：
+
+```bash
+npm run manager:open
+```
+
+![Accio Bridge 管理台截图](79a3e769-88da-48aa-aab6-1078cf20d5bb.png)
+
+管理台支持：
+
+- 查看网关状态和当前用户（脉冲指示灯实时反馈）
+- 通过浏览器完成多账号 OAuth 登录，登录完成后自动记录快照
+- 保存、切换和删除本机账号快照
+- 执行登出、把当前 token 写回账号池文件
+- 按钮 spinner、消息通知自动消失、删除双击确认等交互
+
+## 桌面壳（Electron）
+
+```bash
+npm run desktop:install
+npm run desktop:start
+```
+
+桌面壳会：
+
+- 检查本地 bridge 是否已在线；没起来就自动从仓库目录拉起 `node src/start.js`
+- 把管理台 `/admin` 嵌进桌面窗口
+- 启动本地 desktop helper server（默认 `127.0.0.1:8090`），支持 HTTP 触发 Accio 桌面端拉起
+- 只在"自己拉起了 bridge"时退出才一并结束子进程
+
+说明：当前是本地桌面壳，不是已打包的 `.app` / `.exe`。第一次使用前需要先 `npm run desktop:install`。
+
+## 当前支持
+
+### Anthropic 兼容
+
+- `POST /v1/messages` — 非流式 + SSE 流式
+- `POST /v1/messages/count_tokens`
+- 原生 `tool_use` / `tool_result`
+- Claude 上游事件透传式 SSE
+
+### OpenAI 兼容
+
+- `GET /v1/models`
+- `POST /v1/chat/completions` — 非流式 + SSE 流式
+- `POST /v1/responses` 最小可用子集，含基础 streaming
+- `tools` / `tool_calls`
+
+### 仍然不是完整兼容
+
+- OpenAI 兼容接口是"OpenAI 协议适配 + Claude 上游执行"
+- `/v1/responses` 未补齐 reasoning item 等完整事件语义
+- 图片 block 只做 URL / base64 级别最小映射
+- thinking 只在 `direct-llm` 路径下透传
+- 响应缓存只覆盖低风险纯文本请求
+
+## 认证与账号管理
+
+### 认证来源
+
+通过 `ACCIO_AUTH_MODE` 控制：
+
+| 模式 | 说明 |
+|------|------|
+| `auto` | 先文件账号池 → 环境变量 → 本地网关（默认） |
+| `file` | 只用 `ACCIO_ACCOUNTS_CONFIG_PATH` 账号池文件 |
+| `env` | 只用 `ACCIO_ACCESS_TOKEN` 单 token |
+| `gateway` | 强制复用 Accio 本地登录态 |
+
+### 多账号文件
+
+复制 `config/accounts.example.json` 填入 token：
+
+```json
+{
+  "strategy": "round_robin",
+  "activeAccount": "acct_primary",
+  "accounts": [
+    { "id": "acct_primary", "accessToken": "replace-with-token", "enabled": true, "priority": 1 },
+    { "id": "acct_backup", "tokenFile": "./secrets/backup.token", "enabled": true, "priority": 2 }
+  ]
+}
+```
+
+对应 `.env`：
+
+```bash
+ACCIO_TRANSPORT=direct-llm
+ACCIO_AUTH_MODE=file
+ACCIO_ACCOUNTS_CONFIG_PATH=config/accounts.json
+```
+
+### 单 token 环境变量
+
+```bash
+ACCIO_TRANSPORT=direct-llm
+ACCIO_AUTH_MODE=env
+ACCIO_ACCESS_TOKEN=replace-with-access-token
+ACCIO_AUTH_ACCOUNT_ID=env-default
+```
+
+### 账号快照（本机登录态）
+
+```bash
+npm run auth:state -- status          # 查看当前状态
+npm run auth:state -- snapshot acct_a # 保存快照
+npm run auth:state -- list            # 列出快照
+npm run auth:state -- activate acct_a # 恢复快照
+```
+
+### 辅助命令
+
+```bash
+npm run capture-token -- --write-file --account-id acct_primary  # 抓 token 写入账号池
+npm run auth:relogin -- --write-file --account-id acct_primary --snapshot-alias acct_primary  # 重登录 + 快照
+npm run accounts:list       # 列出账号池
+npm run accounts:probe      # 探测可用账号
+npm run accounts:activate -- acct_backup
+npm run accounts:validate
+```
+
+## 环境变量参考
+
+```bash
+# Transport
+ACCIO_TRANSPORT=auto              # auto | direct-llm | local-ws
+ACCIO_AUTH_MODE=auto              # auto | file | env | gateway
+ACCIO_AUTH_STRATEGY=round_robin
+
+# 账号
+ACCIO_ACCOUNTS_CONFIG_PATH=config/accounts.json
+ACCIO_ACCESS_TOKEN=
+ACCIO_AUTH_ACCOUNT_ID=env-default
+
+# 网关
+ACCIO_GATEWAY_AUTOSTART=1
+ACCIO_APP_PATH=/Applications/Accio.app
+ACCIO_GATEWAY_WAIT_MS=20000
+ACCIO_GATEWAY_POLL_MS=500
+
+# 模型
+ACCIO_MODELS_SOURCE=static        # static | gateway | hybrid
+ACCIO_MODELS_CACHE_TTL_MS=30000
+ACCIO_DIRECT_LLM_BASE_URL=https://phoenix-gw.alibaba.com/api/adk/llm
+
+# 安全防护
+ACCIO_MAX_BODY_BYTES=10485760
+ACCIO_BODY_READ_TIMEOUT_MS=30000
+ACCIO_AUTH_CACHE_TTL_MS=120000
+ACCIO_DEFAULT_MAX_OUTPUT_TOKENS=4096
+
+# 缓存
+ACCIO_RESPONSE_CACHE_TTL_MS=10000
+ACCIO_RESPONSE_CACHE_MAX_ENTRIES=128
+
+# Trace
+ACCIO_TRACE_ENABLED=1
+ACCIO_TRACE_SAMPLE_RATE=0
+ACCIO_TRACE_MAX_ENTRIES=200
+ACCIO_TRACE_MAX_BODY_CHARS=16384
+ACCIO_TRACE_DIR=.data/traces
+
+# 日志
+LOG_LEVEL=info
+```
+
+模型别名映射不需要改代码，直接编辑 `config/model-aliases.json`。
+
+## 代理原理
+
+### 两条执行链路
+
+| 链路 | 说明 |
+|------|------|
+| `direct-llm` | 直接请求 `phoenix-gw` 的 `/api/adk/llm/generateContent`，tool use 语义最完整（默认优先） |
+| `local-ws` | 通过 Accio 本地 WebSocket `sendQuery` 触发 agent，保留 conversation 复用 |
+
+`ACCIO_TRANSPORT=auto`（默认）先尝试 `direct-llm`，失败后回退 `local-ws`。
+
+### 认证分层
+
+`auto` 模式下会按优先级尝试：文件账号池 → 环境变量 → Accio 本地网关。如果走到网关层而 `127.0.0.1:4097` 没起来，bridge 会自动拉起 Accio 桌面端。
+
+`ACCIO_APP_PATH` 支持自动发现（macOS 优先 `/Applications/Accio.app`，其次 `~/Applications/Accio.app`）。
+
+### 低风险降消耗策略
+
+- **默认输出上限**：客户端没传 `max_tokens` 时自动补 `ACCIO_DEFAULT_MAX_OUTPUT_TOKENS`（默认 4096）
+- **短 TTL 精确请求缓存**：只缓存完全相同输入的非流式纯文本请求，默认 TTL 10s，容量 128 条。不缓存 tools/thinking/图片/流式请求
+
+命中缓存时返回 `x-accio-cache: hit`。
+
+### 额外能力
+
+- `x-accio-session-id` / `x-session-id` 会话复用
+- `x-accio-conversation-id` 直接绑定已有 conversation
+- `x-accio-account-id` 按请求指定账号
+- 会话级账号粘性和可识别错误下的多账号 failover
+- 自动发现 Accio 本地 agent / workspace / source
+- 对本地网关超时/连接失败/429/5xx 做错误分类和指数退避重试
+- 响应顶层附加 `accio.*` 调试字段
+
+### 自动发现策略
+
+不手动配置 `ACCIO_*` 变量时，代理会优先选择有可用 DM/source 记录的账号，其次选该账号下的 agent/profile 和默认 workspace。这是启发式策略，不是官方稳定 API。
+
+## 调试工具
+
+### 健康检查
+
+```bash
+curl http://127.0.0.1:8082/healthz
+```
+
+返回当前 agentId、accountId/source、session store 状态、Accio 登录状态、direct LLM 可用性、trace 摘要。
+
+### 本地鉴权探测
+
+```bash
+curl http://127.0.0.1:8082/debug/accio-auth
+```
+
+汇总本地网关地址、`/auth/status` 和 `/debug/auth/status` 结果、是否具备 direct LLM 复用条件。
+
+### Trace 调试样本
+
+默认所有失败请求自动落盘，成功请求需 `ACCIO_TRACE_SAMPLE_RATE` 或 `x-accio-debug-trace: 1` 强制采样。
+
+```bash
+curl http://127.0.0.1:8082/debug/traces
+curl http://127.0.0.1:8082/debug/traces?limit=5
+curl http://127.0.0.1:8082/debug/traces/trace_xxx
+curl http://127.0.0.1:8082/debug/traces/trace_xxx/replay   # 脱敏 curl 复现命令
+```
+
+`authorization`、`token`、`cookie` 等字段会被脱敏。
+
+### 日志
+
+默认 JSON 结构化日志（`ts`/`level`/`msg`/`requestId`/`method`/`path`/`status`/`ms`），通过 `LOG_LEVEL=debug` 调高。
+
+## 请求示例
+
+### Anthropic — 会话复用
+
+```bash
+curl http://127.0.0.1:8082/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-accio-session-id: demo-session' \
+  -d '{"model":"accio-bridge","messages":[{"role":"user","content":"请只回复 SECOND"}]}'
+```
+
+响应头返回 `x-accio-conversation-id` 和 `x-accio-session-id`。
+
+### Anthropic — 工具映射
+
+```bash
+curl http://127.0.0.1:8082/v1/messages \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "accio-bridge",
+    "tools": [{"name":"shell_echo","description":"echo a string","input_schema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}],
+    "messages":[{"role":"user","content":"请在回答前先调用一个工具，然后告诉我你调用了什么。"}]
+  }'
+```
+
+响应带标准 `content[].tool_use` 和自定义 `accio.tool_results`。
+
+### OpenAI — 复用 session
+
+```bash
+curl http://127.0.0.1:8082/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'x-session-id: demo-openai' \
+  -d '{"model":"accio-bridge","messages":[{"role":"user","content":"请只回复 OK"}]}'
+```
+
+### 指定账号
+
+```bash
+curl http://127.0.0.1:8082/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-accio-account-id: acct_primary' \
+  -d '{"model":"accio-bridge","messages":[{"role":"user","content":"请只回复 OK"}]}'
+```
+
+## Accio 鉴权复用现状
+
+Accio 桌面端本地网关（默认 `127.0.0.1:4097`）暴露了 `GET /auth/status`、`GET /auth/user`、`GET /debug/auth/*` 等端点。桌面端源码确认本地保存 `accessToken`/`refreshToken`/`cookie`，请求 `phoenix-gw` 时把 `accessToken` 注入 POST body 并从 cookie 提取 `cna` 到 `x-cna` 请求头。
+
+已验证可以：
+
+- 从 `/debug/auth/ws-status` 提取带 `accessToken` 的上游 WebSocket URL
+- 从 `/debug/auth/http-log` 提取带 `accessToken` 的上游 HTTP 请求日志
+- 直接调用 `POST https://phoenix-gw.alibaba.com/api/auth/userinfo` 和 `/api/adk/llm/generateContent`
+
+本地网关还暴露了 `POST /upload`，会拿本地 Accio Cookie 转发到 `https://filebroker.accio.com/x/upload`。
+
+## 已验证链路
+
+Accio 桌面端本地暴露 HTTP `127.0.0.1:4097` 和 WebSocket `ws://127.0.0.1:4097/websocket/connect?clientId=...`。
+
+代理已验证：
+
+1. 外部进程可以直接访问 `127.0.0.1:4097`
+2. 外部进程可以建立 `/websocket/connect` 发送 `sendQuery`
+3. 可以收到 `ack` / `event.append` / `event.finished` / `channel.message.created`
+4. 请求结果写入 Accio 本地 conversation 存储，可被代理回读补全 tool 映射
 
 ## 测试
-
-项目现在带了零依赖单测，可以直接跑：
 
 ```bash
 npm test
 ```
 
-当前测试覆盖的主要是纯转换逻辑：
+零依赖单测，覆盖 Anthropic/OpenAI 请求压平与响应映射、Direct LLM 请求构造、JSONC 解析、Session 绑定、模型发现、工具校验等。
 
-- Anthropic 请求压平和响应映射
-- OpenAI 请求压平和响应映射
-- Direct LLM 请求构造
-- JSONC 解析
-- Session 绑定规则
+## 目录结构
 
-## 日志
-
-桥接现在默认输出 JSON 结构化日志，包含：
-
-- `ts`
-- `level`
-- `msg`
-- `requestId`
-- `method`
-- `path`
-- `status`
-- `ms`
-
-可以通过下面的环境变量调低或调高日志级别：
-
-```bash
-LOG_LEVEL=debug
+```text
+accio-anthropic-bridge/
+  config/
+    model-aliases.json
+    accounts.example.json
+    accounts.json
+  .env.example
+  .gitignore
+  package.json
+  .data/
+    sessions.json
+  src/
+    accio-client.js
+    accounts-file.js
+    anthropic.js
+    auth-provider.js
+    auth-state.js
+    bootstrap.js
+    bridge-core.js
+    debug-traces.js
+    direct-llm.js
+    discovery.js
+    env-file.js
+    errors.js
+    gateway-manager.js
+    http.js
+    jsonc.js
+    logger.js
+    model.js
+    models.js
+    middleware/
+      body-parser.js
+    openai.js
+    redaction.js
+    request-defaults.js
+    response-cache.js
+    routes/
+      admin.js
+      anthropic.js
+      debug.js
+      health.js
+      openai.js
+    runtime-config.js
+    server.js
+    session-store.js
+    start.js
+    stream/
+      anthropic-sse.js
+      openai-sse.js
+      responses-sse.js
+    tooling.js
+  scripts/
+    accounts.js
+    auth-relogin.js
+    auth-state.js
+    capture-token.js
+    init-env.js
+    open-admin.js
+  desktop/
+    main.js
+    preload.js
+    start.js
+    package.json
+  test/
+    *.test.js
 ```
 
 ## 关键实现文件
 
-- [src/server.js](/Users/snow/accio-anthropic-bridge/src/server.js)
-  服务器装配、路由注册、生命周期管理
-- [src/routes/anthropic.js](/Users/snow/accio-anthropic-bridge/src/routes/anthropic.js)
-  Anthropic Messages 路由与 direct/local-ws 执行链路
-- [src/routes/openai.js](/Users/snow/accio-anthropic-bridge/src/routes/openai.js)
-  OpenAI Chat Completions 路由与 direct/local-ws 执行链路
-- [src/routes/health.js](/Users/snow/accio-anthropic-bridge/src/routes/health.js)
-  健康检查与本地鉴权探测
-- [src/stream/anthropic-sse.js](/Users/snow/accio-anthropic-bridge/src/stream/anthropic-sse.js)
-  Anthropic SSE writer
-- [src/stream/openai-sse.js](/Users/snow/accio-anthropic-bridge/src/stream/openai-sse.js)
-  OpenAI SSE writer
-- [src/accio-client.js](/Users/snow/accio-anthropic-bridge/src/accio-client.js)
-  Accio HTTP/WS 客户端、重试、conversation 回读、tool artifacts 收集
-- [src/discovery.js](/Users/snow/accio-anthropic-bridge/src/discovery.js)
-  本地 `~/.accio` 自动发现
-- [src/session-store.js](/Users/snow/accio-anthropic-bridge/src/session-store.js)
-  session 到 conversation 的持久化映射
-- [config/model-aliases.json](/Users/snow/accio-anthropic-bridge/config/model-aliases.json)
-  可编辑的模型别名映射
-- [src/anthropic.js](/Users/snow/accio-anthropic-bridge/src/anthropic.js)
-  Anthropic 请求压平和响应映射
-- [src/openai.js](/Users/snow/accio-anthropic-bridge/src/openai.js)
-  OpenAI 请求压平和响应映射
+- [src/server.js](src/server.js) — 服务器装配、路由注册、生命周期管理
+- [src/routes/anthropic.js](src/routes/anthropic.js) — Anthropic Messages 路由
+- [src/routes/openai.js](src/routes/openai.js) — OpenAI Chat Completions 路由
+- [src/routes/admin.js](src/routes/admin.js) — 管理台路由，含 OAuth 多账号登录流、快照 CRUD、网关状态 API
+- [src/accio-client.js](src/accio-client.js) — Accio HTTP/WS 客户端、重试、conversation 回读
+- [src/direct-llm.js](src/direct-llm.js) — 直连上游 LLM 的请求构造与 SSE 解析
+- [src/auth-provider.js](src/auth-provider.js) — 认证来源选择、账号池轮询、失效熔断
+- [src/accounts-file.js](src/accounts-file.js) — 本机账号注册表
+- [src/auth-state.js](src/auth-state.js) — 登录态快照管理（保存/激活/删除/完整凭证捕获）
+- [src/gateway-manager.js](src/gateway-manager.js) — 本地网关探测、自动拉起 Accio、token 抓取
+- [src/models.js](src/models.js) — 模型列表管理（静态/网关/混合模式）
+- [src/runtime-config.js](src/runtime-config.js) — 运行时配置加载
+- [src/discovery.js](src/discovery.js) — 本地 `~/.accio` 自动发现
+- [src/session-store.js](src/session-store.js) — session 到 conversation 持久化映射
+- [src/anthropic.js](src/anthropic.js) / [src/openai.js](src/openai.js) — 请求压平和响应映射
+- [src/debug-traces.js](src/debug-traces.js) — 请求样本采样、脱敏落盘与 replay 构造
+- [src/stream/anthropic-sse.js](src/stream/anthropic-sse.js) — Anthropic SSE writer
+- [src/stream/openai-sse.js](src/stream/openai-sse.js) — OpenAI SSE writer
+- [src/stream/responses-sse.js](src/stream/responses-sse.js) — Responses SSE writer
+- [desktop/main.js](desktop/main.js) — Electron 主进程
+- [desktop/preload.js](desktop/preload.js) — contextBridge API
+- [desktop/start.js](desktop/start.js) — 桌面壳启动入口
+- [config/model-aliases.json](config/model-aliases.json) — 可编辑模型别名映射
+- [config/accounts.example.json](config/accounts.example.json) — 账号池模板
 
 ## 已实测结果
 
-本机已经实测通过：
-
-- `GET /healthz`
-- `GET /v1/models`
-- `POST /v1/messages/count_tokens`
-- `POST /v1/messages`
-- `POST /v1/chat/completions`
-- 相同 `session_id` 复用同一个 `conversation_id`
-- 响应中回带 `tool_use` 和 `accio.tool_results`
+- `GET /healthz`、`GET /v1/models`、`POST /v1/messages/count_tokens`
+- `POST /v1/messages`、`POST /v1/chat/completions`、`POST /v1/responses` 最小子集
+- `GET /debug/traces` / `GET /debug/traces/:id` / `GET /debug/traces/:id/replay`
+- `session_id` 复用同一 `conversation_id`，会话级账号粘性
+- 默认输出上限兜底、短 TTL 精确请求缓存
+- 失败请求自动 trace 采样和脱敏 replay 导出
+- `tool_use` / `tool_calls` / `accio.tool_results` 响应
+- `GET /admin` 管理台、`GET /admin/api/state`、OAuth 登录流、快照删除
+- 45 项单元测试全部通过
 
 ## 后续还可以继续做
 
-1. 增加图片和多模态映射
-2. 把 `tool_result` 也映射成更接近官方协议的往返流程
-3. 增加 `/v1/responses` 或更多 OpenAI 兼容端点
-4. 在用户显式授权前提下，研究是否增加 Electron helper 去读取本地加密凭证
-5. 如果找到 Accio 本地可复用的上游 LLM 代发端点，再尝试做更深的直连适配
-6. 增加 conversation 清理和 session 过期策略
-7. 增加更细的日志与 debug tracing
+1. 补齐 `tool_result` 往返协议，包括更完整的 multi-turn tool loop
+2. 扩展 `/v1/responses` 的 reasoning item、tool_result item 事件覆盖
+3. 更完整的图片/多模态上传桥接
+4. 如果找到更稳定的 Accio 上游 LLM 代发入口，做更深的直连适配
+5. 在 trace store 基础上补 trace diff、导出 CLI 和自动复跑工具
+6. 补充 live integration test
+7. 将桌面壳打包为 `.app` / `.exe` / `.deb` 发布物
+8. 管理台增加账号分组、备注标签、批量操作

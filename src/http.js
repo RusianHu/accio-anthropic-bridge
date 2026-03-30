@@ -3,12 +3,26 @@
 const CORS_HEADERS = Object.freeze({
   "access-control-allow-origin": "*",
   "access-control-allow-headers":
-    "content-type,authorization,x-api-key,anthropic-version,x-accio-session-id,x-accio-conversation-id,x-session-id",
+    "content-type,authorization,x-api-key,anthropic-version,x-accio-session-id,x-accio-conversation-id,x-session-id,x-accio-account-id,x-account-id,x-request-id",
   "access-control-allow-methods": "GET,POST,OPTIONS"
 });
 
 function writeJson(res, statusCode, body, extraHeaders = {}) {
+  if (!res || res.writableEnded || res.destroyed) {
+    return false;
+  }
+
   const payload = JSON.stringify(body);
+
+  if (res.headersSent) {
+    try {
+      res.end();
+    } catch {
+      // Ignore secondary stream shutdown failures.
+    }
+    return false;
+  }
+
   res.writeHead(statusCode, {
     ...CORS_HEADERS,
     ...extraHeaders,
@@ -16,6 +30,7 @@ function writeJson(res, statusCode, body, extraHeaders = {}) {
     "content-length": Buffer.byteLength(payload)
   });
   res.end(payload);
+  return true;
 }
 
 function writeSse(res, event, data) {

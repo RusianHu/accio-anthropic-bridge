@@ -2,80 +2,88 @@
 
 const crypto = require("node:crypto");
 const http = require("node:http");
-const path = require("node:path");
-const { URL } = require("node:url");
 
 const { AccioClient, HttpError } = require("./accio-client");
-const { buildErrorResponse, flattenAnthropicRequest } = require("./anthropic");
+const { AuthProvider } = require("./auth-provider");
+const { buildErrorResponse } = require("./anthropic");
+const { DebugTraceStore, setTraceError, updateTrace } = require("./debug-traces");
 const { DirectLlmClient } = require("./direct-llm");
-const { discoverAccioConfig } = require("./discovery");
 const { classifyErrorType } = require("./errors");
+const { GatewayManager } = require("./gateway-manager");
 const { CORS_HEADERS, writeJson } = require("./http");
 const log = require("./logger");
+const { ModelsRegistry } = require("./models");
+const { ResponseCache } = require("./response-cache");
+const { handleTraceDetail, handleTraceReplay, handleTracesList } = require("./routes/debug");
+const {
+  handleAdminPage,
+  handleAdminState,
+  handleAdminQuotaRefresh,
+  handleAdminSnapshotCreate,
+  handleAdminSnapshotActivate,
+  handleAdminSnapshotDelete,
+  handleAdminGatewayLogin,
+  handleAdminGatewayLogout,
+  handleAdminCaptureAccount,
+  handleAdminAccountLogin,
+  handleAdminAccountCallback,
+  handleAdminAccountLoginStatus
+} = require("./routes/admin");
 const { handleAccioAuthProbe, handleHealth } = require("./routes/health");
 const { handleCountTokens, handleMessagesRequest } = require("./routes/anthropic");
-const { buildOpenAiModelsResponse, handleChatCompletionsRequest } = require("./routes/openai");
+const { handleChatCompletionsRequest, handleModelsRequest, handleResponsesRequest } = require("./routes/openai");
+const { createConfig } = require("./runtime-config");
 const { SessionStore } = require("./session-store");
 
 function generateId(prefix) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
 }
 
-function env(name, fallback) {
-  return process.env[name] || fallback;
-}
+function captureTrace(traceStore, req, res, requestMeta, startedAt) {
+  if (!traceStore || !req.bridgeContext || req.bridgeContext.traceCaptured) {
+    return;
+  }
 
-function createConfig() {
-  const discovered = discoverAccioConfig({
-    accountId: env("ACCIO_ACCOUNT_ID", ""),
-    accioHome: env("ACCIO_HOME", ""),
-    agentId: env("ACCIO_AGENT_ID", ""),
-    language: env("ACCIO_LANGUAGE", ""),
-    sourceChannelId: env("ACCIO_SOURCE_CHANNEL_ID", ""),
-    sourceChatId: env("ACCIO_SOURCE_CHAT_ID", ""),
-    sourceChatType: env("ACCIO_SOURCE_CHAT_TYPE", ""),
-    sourceUserId: env("ACCIO_SOURCE_USER_ID", ""),
-    workspacePath: env("ACCIO_WORKSPACE_PATH", "")
+  const trace = req.bridgeContext.trace;
+
+  if (!trace || !trace.protocol) {
+    return;
+  }
+
+  req.bridgeContext.traceCaptured = true;
+  traceStore.record({
+    ...trace,
+    id: generateId("trace"),
+    requestId: requestMeta.requestId,
+    method: requestMeta.method,
+    path: requestMeta.path,
+    ts: startedAt,
+    durationMs: Date.now() - startedAt,
+    statusCode: Number((trace.response && trace.response.statusCode) || res.statusCode || 0)
   });
-
-  return {
-    port: Number(env("PORT", "8082")),
-    baseUrl: env("ACCIO_BASE_URL", "http://127.0.0.1:4097"),
-    accioHome: discovered.accioHome,
-    accountId: discovered.accountId,
-    agentId: discovered.agentId,
-    workspacePath: discovered.workspacePath,
-    language: discovered.language,
-    sourceChannelId: discovered.sourceChannelId,
-    sourceChatId: discovered.sourceChatId,
-    sourceUserId: discovered.sourceUserId,
-    sourceChatType: discovered.sourceChatType,
-    sourcePlatform: env("ACCIO_SOURCE_PLATFORM", "pcApp"),
-    sourceType: env("ACCIO_SOURCE_TYPE", "im"),
-    requestTimeoutMs: Number(env("ACCIO_REQUEST_TIMEOUT_MS", "120000")),
-    transportMode: env("ACCIO_TRANSPORT", "auto"),
-    directLlmBaseUrl: env(
-      "ACCIO_DIRECT_LLM_BASE_URL",
-      "https://phoenix-gw.alibaba.com/api/adk/llm"
-    ),
-    clientIdPrefix: env("ACCIO_CLIENT_ID_PREFIX", "anthropic-bridge"),
-    sessionStorePath: env(
-      "ACCIO_SESSION_STORE_PATH",
-      path.join(process.cwd(), ".data", "sessions.json")
-    ),
-    maxRetries: Number(env("ACCIO_MAX_RETRIES", "2")),
-    retryBaseMs: Number(env("ACCIO_RETRY_BASE_MS", "250")),
-    retryMaxDelayMs: Number(env("ACCIO_RETRY_MAX_DELAY_MS", "2500"))
-  };
 }
 
-function createServer(client, directClient, sessionStore) {
+function createServer(config, client, directClient, authProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore) {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const startTime = Date.now();
     const requestId = String(req.headers["x-request-id"] || generateId("req"));
 
     res.setHeader("x-request-id", requestId);
+    req.bridgeContext = {
+      bodyParser: {
+        maxBytes: client.config.maxBodyBytes,
+        timeoutMs: client.config.bodyReadTimeoutMs
+      },
+      requestId,
+      trace: {
+        request: {
+          headers: req.headers
+        },
+        response: {},
+        bridge: {}
+      }
+    };
 
     const requestMeta = {
       requestId,
@@ -106,51 +114,174 @@ function createServer(client, directClient, sessionStore) {
           name: "accio-anthropic-bridge",
           ok: true,
           endpoints: [
+            "GET /admin",
+            "GET /admin/api/state",
+            "POST /admin/api/quotas/refresh",
+            "POST /admin/api/snapshots",
+            "POST /admin/api/snapshots/activate",
+            "POST /admin/api/snapshots/delete",
+            "POST /admin/api/gateway/login",
+            "POST /admin/api/gateway/logout",
+            "POST /admin/api/accounts/login",
+            "GET /admin/api/accounts/callback",
+            "GET /admin/api/accounts/login-status",
+            "POST /admin/api/accounts/capture",
             "GET /healthz",
             "GET /debug/accio-auth",
+            "GET /debug/traces",
+            "GET /debug/traces/:id",
+            "GET /debug/traces/:id/replay",
             "GET /v1/models",
             "POST /v1/messages",
             "POST /v1/messages/count_tokens",
-            "POST /v1/chat/completions"
+            "POST /v1/chat/completions",
+            "POST /v1/responses"
           ]
         });
         finishLog("info", "request completed", { status: 200 });
         return;
       }
 
+      if (req.method === "GET" && url.pathname === "/admin") {
+        await handleAdminPage(req, res, config);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-ui" });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/admin/api/state") {
+        await handleAdminState(req, res, config, authProvider);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/quotas/refresh") {
+        await handleAdminQuotaRefresh(req, res, config, authProvider);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/snapshots") {
+        await handleAdminSnapshotCreate(req, res, config);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/snapshots/activate") {
+        await handleAdminSnapshotActivate(req, res, config, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/snapshots/delete") {
+        await handleAdminSnapshotDelete(req, res);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/gateway/login") {
+        await handleAdminGatewayLogin(req, res, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/gateway/logout") {
+        await handleAdminGatewayLogout(req, res, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/accounts/login") {
+        await handleAdminAccountLogin(req, res, config, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/admin/api/accounts/callback") {
+        await handleAdminAccountCallback(req, res, config, url, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/admin/api/accounts/login-status") {
+        await handleAdminAccountLoginStatus(req, res, config, url);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/admin/api/accounts/capture") {
+        await handleAdminCaptureAccount(req, res, config, gatewayManager);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
       if (req.method === "GET" && url.pathname === "/healthz") {
-        await handleHealth(req, res, client, directClient, sessionStore);
-        finishLog("info", "request completed", { status: 200 });
+        await handleHealth(req, res, client, directClient, sessionStore, modelsRegistry, responseCache, traceStore);
+        finishLog("info", "request completed", { status: res.statusCode || 200 });
         return;
       }
 
       if (req.method === "GET" && url.pathname === "/debug/accio-auth") {
         await handleAccioAuthProbe(req, res, client, directClient);
-        finishLog("info", "request completed", { status: 200 });
+        finishLog("info", "request completed", { status: res.statusCode || 200 });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/debug/traces") {
+        handleTracesList(req, res, traceStore, url);
+        finishLog("info", "request completed", { status: res.statusCode || 200 });
+        return;
+      }
+
+      if (req.method === "GET" && /^\/debug\/traces\/[^/]+$/.test(url.pathname)) {
+        handleTraceDetail(req, res, traceStore, url.pathname.split("/").pop());
+        finishLog("info", "request completed", { status: res.statusCode || 200 });
+        return;
+      }
+
+      if (req.method === "GET" && /^\/debug\/traces\/[^/]+\/replay$/.test(url.pathname)) {
+        const segments = url.pathname.split("/");
+        const traceId = segments[segments.length - 2];
+        handleTraceReplay(req, res, traceStore, traceId, `http://${req.headers.host || `127.0.0.1:${client.config.port}`}`);
+        finishLog("info", "request completed", { status: res.statusCode || 200 });
         return;
       }
 
       if (req.method === "GET" && url.pathname === "/v1/models") {
-        writeJson(res, 200, buildOpenAiModelsResponse());
-        finishLog("info", "request completed", { status: 200 });
+        await handleModelsRequest(req, res, modelsRegistry);
+        captureTrace(traceStore, req, res, requestMeta, startTime);
+        finishLog("info", "request completed", {
+          status: res.statusCode || 200,
+          protocol: "openai",
+          modelsSource: client.config.modelsSource
+        });
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/v1/messages") {
-        await handleMessagesRequest(req, res, client, directClient, sessionStore);
-        finishLog("info", "request completed", { status: 200, protocol: "anthropic" });
+        await handleMessagesRequest(req, res, client, directClient, sessionStore, responseCache);
+        captureTrace(traceStore, req, res, requestMeta, startTime);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "anthropic" });
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
-        await handleCountTokens(req, res, flattenAnthropicRequest);
-        finishLog("info", "request completed", { status: 200, protocol: "anthropic" });
+        await handleCountTokens(req, res);
+        captureTrace(traceStore, req, res, requestMeta, startTime);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "anthropic" });
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-        await handleChatCompletionsRequest(req, res, client, directClient, sessionStore);
-        finishLog("info", "request completed", { status: 200, protocol: "openai" });
+        await handleChatCompletionsRequest(req, res, client, directClient, sessionStore, responseCache);
+        captureTrace(traceStore, req, res, requestMeta, startTime);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "openai" });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/responses") {
+        await handleResponsesRequest(req, res, client, directClient, sessionStore, responseCache);
+        captureTrace(traceStore, req, res, requestMeta, startTime);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "openai-responses" });
         return;
       }
 
@@ -167,18 +298,45 @@ function createServer(client, directClient, sessionStore) {
             ? error.message
             : String(error);
 
+      const errorType =
+        error && typeof error.type === "string"
+          ? error.type
+          : classifyErrorType(statusCode, error);
+
       log.error("request failed", {
         ...requestMeta,
         status: statusCode,
         error: message,
+        type: errorType,
         ms: Date.now() - startTime
       });
 
-      writeJson(
-        res,
-        statusCode,
-        buildErrorResponse(message, classifyErrorType(statusCode, error))
+      const errorBody = buildErrorResponse(
+        message,
+        errorType,
+        error && error.details ? { details: error.details } : {}
       );
+
+      setTraceError(req, res, statusCode, error, error && error.details ? error.details : null);
+      updateTrace(req, {
+        response: {
+          statusCode,
+          body: errorBody
+        }
+      });
+
+      if (res.headersSent || res.writableEnded || res.destroyed) {
+        log.warn("response already started; skipping JSON error write", {
+          ...requestMeta,
+          status: statusCode,
+          ms: Date.now() - startTime
+        });
+        captureTrace(traceStore, req, res, requestMeta, startTime);
+        return;
+      }
+
+      writeJson(res, statusCode, errorBody);
+      captureTrace(traceStore, req, res, requestMeta, startTime);
     }
   });
 }
@@ -186,13 +344,37 @@ function createServer(client, directClient, sessionStore) {
 async function main() {
   const config = createConfig();
   const client = new AccioClient(config);
+  const authProvider = new AuthProvider(config);
+  const gatewayManager = new GatewayManager({
+    baseUrl: config.baseUrl,
+    appPath: config.appPath,
+    autostartEnabled: config.gatewayAutostart,
+    waitMs: config.gatewayWaitMs,
+    pollMs: config.gatewayPollMs
+  });
   const directClient = new DirectLlmClient({
+    authMode: config.authMode,
+    authProvider,
+    gatewayManager,
     localGatewayBaseUrl: config.baseUrl,
     requestTimeoutMs: config.requestTimeoutMs,
-    upstreamBaseUrl: config.directLlmBaseUrl
+    upstreamBaseUrl: config.directLlmBaseUrl,
+    authCacheTtlMs: config.authCacheTtlMs
   });
   const sessionStore = new SessionStore(config.sessionStorePath);
-  const server = createServer(client, directClient, sessionStore);
+  const modelsRegistry = new ModelsRegistry(config);
+  const responseCache = new ResponseCache({
+    ttlMs: config.responseCacheTtlMs,
+    maxEntries: config.responseCacheMaxEntries
+  });
+  const traceStore = new DebugTraceStore({
+    enabled: config.traceEnabled,
+    dirPath: config.traceDir,
+    maxEntries: config.traceMaxEntries,
+    maxStringLength: config.traceMaxBodyChars,
+    sampleRate: config.traceSampleRate
+  });
+  const server = createServer(config, client, directClient, authProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore);
 
   let shuttingDown = false;
 
