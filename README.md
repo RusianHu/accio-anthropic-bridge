@@ -126,7 +126,8 @@ npm run desktop:dist   # 生成正式分发产物
 - 原生 `tool_use` / `tool_result`
 - 直连上游 SSE 透传
 - 外部 Anthropic fallback 返回 JSON 时自动合成为 Anthropic SSE，兼容 `Claude Code`
-- 外部 OpenAI fallback 会优先尝试 `/chat/completions`，不支持时自动切到 `/responses`
+- 外部上游配置里的“协议”可直接选择 `OpenAI Auto`、`OpenAI Chat Completions`、`OpenAI Responses` 或 `Anthropic Messages`
+- `OpenAI Auto` 模式只在首次探测一次可用端点，并按渠道缓存结果；已明确指定的渠道不会再试错
 
 ### OpenAI 兼容
 
@@ -234,7 +235,7 @@ ACCIO_MODELS_SOURCE=static        # static | gateway | hybrid
 ACCIO_MODELS_CACHE_TTL_MS=30000
 ACCIO_DIRECT_LLM_BASE_URL=https://phoenix-gw.alibaba.com/api/adk/llm
 ACCIO_FALLBACKS_JSON=             # 推荐，多渠道数组配置（管理台会维护这个字段）
-ACCIO_FALLBACK_PROTOCOL=openai    # openai | anthropic
+ACCIO_FALLBACK_PROTOCOL=openai    # openai | openai-chat-completions | openai-responses | anthropic
 ACCIO_FALLBACK_OPENAI_BASE_URL=   # 可选，最后兜底的外部上游 base URL
 ACCIO_FALLBACK_OPENAI_API_KEY=
 ACCIO_FALLBACK_OPENAI_MODEL=

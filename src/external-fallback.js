@@ -17,11 +17,60 @@ function normalizeReasoningEffort(value) {
   return ["low", "medium", "high"].includes(text) ? text : "";
 }
 
+function normalizeProtocolSelection(protocolValue, openaiApiStyleValue) {
+  const protocol = String(protocolValue || "").trim().toLowerCase();
+  const openaiApiStyle = normalizeOpenAiApiStyle(openaiApiStyleValue);
+
+  if (protocol === "anthropic") {
+    return {
+      protocol: "anthropic",
+      openaiApiStyle: "auto"
+    };
+  }
+
+  if (protocol === "openai-responses" || protocol === "openai_responses" || protocol === "responses") {
+    return {
+      protocol: "openai",
+      openaiApiStyle: "responses"
+    };
+  }
+
+  if (
+    protocol === "openai-chat-completions" ||
+    protocol === "openai_chat_completions" ||
+    protocol === "chat_completions"
+  ) {
+    return {
+      protocol: "openai",
+      openaiApiStyle: "chat_completions"
+    };
+  }
+
+  if (protocol === "openai-auto" || protocol === "openai_auto") {
+    return {
+      protocol: "openai",
+      openaiApiStyle: "auto"
+    };
+  }
+
+  return {
+    protocol: "openai",
+    openaiApiStyle
+  };
+}
+
+function normalizeOpenAiApiStyle(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return ["chat_completions", "responses", "auto"].includes(text) ? text : "auto";
+}
+
 function stripTrailingSlash(value) {
   return String(value || "").trim().replace(/\/$/, "");
 }
 
 function normalizeFallbackTarget(target = {}, index = 0) {
+  const selection = normalizeProtocolSelection(target.protocol, target.openaiApiStyle);
+
   return {
     id: String(target.id || createFallbackId()),
     name: String(target.name || ("渠道 " + (index + 1))).trim() || ("渠道 " + (index + 1)),
@@ -29,10 +78,35 @@ function normalizeFallbackTarget(target = {}, index = 0) {
     baseUrl: stripTrailingSlash(target.baseUrl || ""),
     apiKey: String(target.apiKey || "").trim(),
     model: String(target.model || "").trim(),
-    protocol: String(target.protocol || "openai").toLowerCase() === "anthropic" ? "anthropic" : "openai",
+    protocol: selection.protocol,
+    openaiApiStyle: selection.openaiApiStyle,
     anthropicVersion: String(target.anthropicVersion || DEFAULT_ANTHROPIC_VERSION).trim() || DEFAULT_ANTHROPIC_VERSION,
     timeoutMs: Number(target.timeoutMs || 60000) || 60000,
     reasoningEffort: normalizeReasoningEffort(target.reasoningEffort)
+  };
+}
+
+function serializeFallbackTarget(target = {}) {
+  const normalized = normalizeFallbackTarget(target, 0);
+  const protocol = normalized.protocol === "anthropic"
+    ? "anthropic"
+    : normalized.openaiApiStyle === "responses"
+      ? "openai-responses"
+      : normalized.openaiApiStyle === "chat_completions"
+        ? "openai-chat-completions"
+        : "openai";
+
+  return {
+    id: normalized.id,
+    name: normalized.name,
+    enabled: normalized.enabled,
+    baseUrl: normalized.baseUrl,
+    apiKey: normalized.apiKey,
+    model: normalized.model,
+    protocol,
+    anthropicVersion: normalized.anthropicVersion,
+    timeoutMs: normalized.timeoutMs,
+    reasoningEffort: normalized.reasoningEffort
   };
 }
 
@@ -539,10 +613,13 @@ class ExternalFallbackClient {
     this.model = String(config.model || "");
     this.timeoutMs = Number(config.timeoutMs || 60000);
     this.protocol = String(config.protocol || "openai").toLowerCase() === "anthropic" ? "anthropic" : "openai";
+    this.openaiApiStyle = normalizeOpenAiApiStyle(config.openaiApiStyle);
     this.anthropicVersion = String(config.anthropicVersion || DEFAULT_ANTHROPIC_VERSION || "2023-06-01");
     this.reasoningEffort = normalizeReasoningEffort(config.reasoningEffort);
     this.preferredAnthropicMessagesPath = null;
-    this.preferredOpenAiEndpoint = null;
+    this.preferredOpenAiEndpoint = this.protocol === "openai" && this.openaiApiStyle !== "auto"
+      ? this.openaiApiStyle
+      : null;
   }
 
   isConfigured() {
@@ -712,6 +789,14 @@ class ExternalFallbackClient {
   }
 
   buildOpenAiEndpoints() {
+    if (this.openaiApiStyle === "chat_completions") {
+      return ["chat_completions"];
+    }
+
+    if (this.openaiApiStyle === "responses") {
+      return ["responses"];
+    }
+
     const preferred = this.preferredOpenAiEndpoint;
     const ordered = [];
     const push = (name) => {
@@ -745,6 +830,14 @@ class ExternalFallbackClient {
         stream: true
       })
     });
+  }
+
+  rememberOpenAiEndpoint(endpoint) {
+    if (this.protocol !== "openai" || this.openaiApiStyle !== "auto") {
+      return;
+    }
+
+    this.preferredOpenAiEndpoint = endpoint === "responses" ? "responses" : "chat_completions";
   }
 
   async collectOpenAiResponsesStream(response) {
@@ -930,7 +1023,7 @@ class ExternalFallbackClient {
             };
             const responsesResponse = await this.requestOpenAiResponses(responsesBody);
             const result = await this.collectOpenAiResponsesStream(responsesResponse);
-            this.preferredOpenAiEndpoint = "responses";
+            this.rememberOpenAiEndpoint("responses");
             return result;
           }
 
@@ -949,11 +1042,12 @@ class ExternalFallbackClient {
               }
             });
           }
-          this.preferredOpenAiEndpoint = "chat_completions";
+          this.rememberOpenAiEndpoint("chat_completions");
           break;
         } catch (error) {
           lastError = error;
           if (endpoint === "chat_completions" && isOpenAiChatCompletionsUnsupported(error)) {
+            this.rememberOpenAiEndpoint("responses");
             continue;
           }
           throw error;
@@ -1046,6 +1140,7 @@ class ExternalFallbackClient {
         protocol: this.protocol,
         transport: this.transportName(),
         model: result.model || this.model,
+        openaiApiStyle: null,
         usage: result.usage || null,
         preview: result.text || ""
       };
@@ -1061,6 +1156,9 @@ class ExternalFallbackClient {
       protocol: this.protocol,
       transport: this.transportName(),
       model: result.model || this.model,
+      openaiApiStyle: this.openaiApiStyle === "auto"
+        ? (this.preferredOpenAiEndpoint || "chat_completions")
+        : this.openaiApiStyle,
       usage: result.usage || null,
       preview: result.text || ""
     };
@@ -1075,13 +1173,26 @@ class ExternalFallbackPool {
 
   updateConfig(config = {}) {
     const targets = normalizeFallbackTargets(config.targets || []);
+    const previousEntries = Array.isArray(this.entries) ? this.entries : [];
+    const previousClientsById = new Map(previousEntries.map((entry) => [entry.target.id, entry.client]));
     this.targets = targets;
     this.entries = targets.map((target) => ({
       target,
-      client: new ExternalFallbackClient({
-        ...target,
-        fetchImpl: this.fetchImpl
-      })
+      client: (() => {
+        const existing = previousClientsById.get(target.id);
+        if (existing) {
+          existing.updateConfig({
+            ...target,
+            fetchImpl: this.fetchImpl
+          });
+          return existing;
+        }
+
+        return new ExternalFallbackClient({
+          ...target,
+          fetchImpl: this.fetchImpl
+        });
+      })()
     }));
     return this.targets;
   }
@@ -1091,7 +1202,7 @@ class ExternalFallbackPool {
   }
 
   getSettings() {
-    return this.targets.map((target) => ({ ...target }));
+    return this.targets.map((target) => serializeFallbackTarget(target));
   }
 
   getEligibleAnthropic(body) {
@@ -1115,6 +1226,7 @@ module.exports = {
   anthropicToFallbackMessages,
   normalizeFallbackTarget,
   normalizeFallbackTargets,
+  serializeFallbackTarget,
   openAiToAnthropicPayload,
   openAiToFallbackMessages,
   shouldFallbackToExternalProvider

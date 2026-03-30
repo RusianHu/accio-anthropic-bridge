@@ -21,7 +21,7 @@ const {
   writeSnapshotAuthPayload
 } = require("../auth-state");
 const { writeAccountToFile, findStoredAccountAuthPayload } = require("../accounts-file");
-const { ExternalFallbackClient, normalizeFallbackTarget, normalizeFallbackTargets } = require("../external-fallback");
+const { ExternalFallbackClient, normalizeFallbackTarget, normalizeFallbackTargets, serializeFallbackTarget } = require("../external-fallback");
 const { maskToken } = require("../redaction");
 const log = require("../logger");
 
@@ -132,7 +132,7 @@ function upsertEnvValues(filePath, values) {
 function getFallbackSettings(config) {
   const targets = normalizeFallbackTargets(config.fallbackTargets || []);
   return {
-    targets
+    targets: targets.map((target) => serializeFallbackTarget(target))
   };
 }
 
@@ -160,7 +160,7 @@ function applyFallbackSettings(config, fallbackPool, settings) {
     fallbackPool.updateConfig({ targets });
   }
 
-  return { targets };
+  return { targets: targets.map((target) => serializeFallbackTarget(target)), normalizedTargets: targets };
 }
 
 function escapeHtml(value) {
@@ -2656,11 +2656,22 @@ function createFallbackDraftTarget(index) {
   };
 }
 function normalizeFallbackDraftTarget(target, index) {
+  const rawProtocol = String(target && target.protocol ? target.protocol : '').toLowerCase();
+  const rawApiStyle = String(target && target.openaiApiStyle ? target.openaiApiStyle : '').toLowerCase();
+  const normalizedProtocol = ['openai', 'openai-chat-completions', 'openai-responses', 'anthropic'].includes(rawProtocol)
+    ? rawProtocol
+    : 'openai';
+  const protocol = normalizedProtocol === 'openai' && rawApiStyle === 'responses'
+    ? 'openai-responses'
+    : (normalizedProtocol === 'openai' && rawApiStyle === 'chat_completions'
+      ? 'openai-chat-completions'
+      : normalizedProtocol);
+
   return {
     id: String(target && target.id ? target.id : ('draft_' + index)),
     name: String(target && target.name ? target.name : ('渠道 ' + (index + 1))).trim() || ('渠道 ' + (index + 1)),
     enabled: target && target.enabled !== false,
-    protocol: target && target.protocol === 'anthropic' ? 'anthropic' : 'openai',
+    protocol,
     baseUrl: String(target && target.baseUrl ? target.baseUrl : ''),
     apiKey: String(target && target.apiKey ? target.apiKey : ''),
     model: String(target && target.model ? target.model : ''),
@@ -2706,7 +2717,11 @@ function renderFallbackTargets() {
   const targets = Array.isArray(fallbackDraft) ? fallbackDraft : [];
   els.fallbackEmpty.style.display = targets.length === 0 ? '' : 'none';
   els.fallbackTargets.innerHTML = targets.map((target, index) => {
-    const protocolLabel = target.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI';
+    const protocolLabel = target.protocol === 'anthropic'
+      ? 'Anthropic Messages'
+      : (target.protocol === 'openai-chat-completions'
+        ? 'OpenAI Chat Completions'
+        : (target.protocol === 'openai-responses' ? 'OpenAI Responses' : 'OpenAI Auto'));
     const enabledAttr = target.enabled ? 'true' : 'false';
     // 默认折叠，只有已明确展开过的保持展开
     const collapsed = expandedIds.has(target.id) ? '' : ' data-collapsed="true"';
@@ -2730,7 +2745,7 @@ function renderFallbackTargets() {
       + '<div class="fallbackCardBody">'
       + '<div class="settingsGrid">'
       + '<div class="field"><label>名称</label><input data-field="name" type="text" value="' + escapeInline(target.name) + '" placeholder="渠道 1" autocomplete="off" /></div>'
-      + '<div class="field"><label>协议</label><select data-field="protocol"><option value="openai"' + (target.protocol === 'openai' ? ' selected' : '') + '>OpenAI compatible</option><option value="anthropic"' + (target.protocol === 'anthropic' ? ' selected' : '') + '>Anthropic Messages</option></select></div>'
+      + '<div class="field"><label>协议</label><select data-field="protocol"><option value="openai"' + (target.protocol === 'openai' ? ' selected' : '') + '>OpenAI Auto</option><option value="openai-chat-completions"' + (target.protocol === 'openai-chat-completions' ? ' selected' : '') + '>OpenAI Chat Completions</option><option value="openai-responses"' + (target.protocol === 'openai-responses' ? ' selected' : '') + '>OpenAI Responses</option><option value="anthropic"' + (target.protocol === 'anthropic' ? ' selected' : '') + '>Anthropic Messages</option></select></div>'
       + '<div class="field wide"><label>Base URL</label><input data-field="baseUrl" type="text" value="' + escapeInline(target.baseUrl) + '" placeholder="https://your-upstream-host/v1" autocomplete="off" /></div>'
       + '<div class="field wide"><label>API Key</label><div class="inputWrap"><input data-field="apiKey" type="password" value="' + escapeInline(target.apiKey) + '" placeholder="sk-..." autocomplete="off" autocapitalize="off" spellcheck="false" /><button class="inputToggle" type="button" data-toggle-secret="' + escapeInline(target.id) + '" aria-label="显示 API Key" title="显示或隐藏 API Key">👁</button></div></div>'
       + '<div class="field"><label>Model</label><input data-field="model" type="text" value="' + escapeInline(target.model) + '" placeholder="gpt-4.1-mini" autocomplete="off" /></div>'
@@ -3235,8 +3250,9 @@ if (els.fallbackTargets) {
           body: { target }
         });
         const result = payload && payload.result ? payload.result : {};
+        const apiStyle = result.openaiApiStyle ? (' · ' + result.openaiApiStyle) : '';
         const preview = result.preview ? ('，返回预览：' + String(result.preview).slice(0, 80)) : '';
-        setConfigMessage('ok', '连接成功：' + (target.name || '渠道') + ' · ' + (result.protocol || 'unknown') + ' · ' + (result.model || 'unknown') + preview);
+        setConfigMessage('ok', '连接成功：' + (target.name || '渠道') + ' · ' + (result.protocol || 'unknown') + apiStyle + ' · ' + (result.model || 'unknown') + preview);
       }).catch((error) => {
         setConfigMessage('error', error && error.message ? error.message : String(error));
       });
@@ -3402,7 +3418,7 @@ async function handleAdminConfigSave(req, res, config, fallbackPool) {
   const nextSettings = applyFallbackSettings(config, fallbackPool, {
     targets: Array.isArray(fallbacks.targets) ? fallbacks.targets : []
   });
-  const primary = nextSettings.targets[0] || null;
+  const primary = nextSettings.normalizedTargets[0] || null;
 
   const envPath = config.envPath || path.join(process.cwd(), ".env");
   upsertEnvValues(envPath, {
