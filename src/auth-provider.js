@@ -1,11 +1,13 @@
 "use strict";
 
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const path = require("node:path");
 
 const log = require("./logger");
 
 const INVALIDATION_MS = 5 * 60 * 1000;
+const SAVE_DEBOUNCE_MS = 500;
 
 function normalizeMode(mode) {
   const value = String(mode || "auto").trim().toLowerCase();
@@ -31,10 +33,128 @@ class AuthProvider {
     this._invalidAccounts = new Map();
     this._lastFailures = new Map();
     this._fileCache = null;
+    this._saveTimer = null;
+    this._pendingWrite = Promise.resolve();
+    this.loadState();
   }
 
   _resolveAccountsPath() {
     return path.resolve(this.config.accountsPath || path.join(process.cwd(), "config", "accounts.json"));
+  }
+
+  _resolveStatePath() {
+    return path.resolve(
+      this.config.authStatePath || path.join(process.cwd(), ".data", "auth-provider-state.json")
+    );
+  }
+
+  loadState() {
+    const statePath = this._resolveStatePath();
+
+    try {
+      const text = fs.readFileSync(statePath, "utf8");
+      const parsed = JSON.parse(text);
+      const invalidAccounts = parsed && typeof parsed.invalidAccounts === "object"
+        ? parsed.invalidAccounts
+        : {};
+      const lastFailures = parsed && typeof parsed.lastFailures === "object"
+        ? parsed.lastFailures
+        : {};
+
+      this._invalidAccounts = new Map(
+        Object.entries(invalidAccounts)
+          .map(([accountId, until]) => [String(accountId), Number(until) || 0])
+          .filter(([, until]) => Number.isFinite(until) && until > 0)
+      );
+      this._lastFailures = new Map(
+        Object.entries(lastFailures)
+          .filter(([, value]) => value && typeof value === "object")
+          .map(([accountId, value]) => [String(accountId), value])
+      );
+    } catch (error) {
+      if (error && error.code !== "ENOENT") {
+        log.debug("auth provider state load skipped", {
+          path: statePath,
+          error: error.message || String(error)
+        });
+      }
+    }
+
+    this._purgeExpiredInvalidations();
+  }
+
+  _purgeExpiredInvalidations() {
+    const now = Date.now();
+    let changed = false;
+
+    for (const [accountId, until] of this._invalidAccounts.entries()) {
+      if (!Number.isFinite(until) || until <= now) {
+        this._invalidAccounts.delete(accountId);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      this.save();
+    }
+  }
+
+  _scheduleSave() {
+    if (this._saveTimer) {
+      return;
+    }
+
+    this._saveTimer = setTimeout(() => {
+      this._saveTimer = null;
+      this._pendingWrite = this._pendingWrite
+        .then(() => this._saveAsync())
+        .catch((error) => {
+          log.warn("auth provider async save failed", {
+            path: this._resolveStatePath(),
+            error: error && error.message ? error.message : String(error)
+          });
+        });
+    }, SAVE_DEBOUNCE_MS);
+  }
+
+  async _saveAsync() {
+    const statePath = this._resolveStatePath();
+    await fsp.mkdir(path.dirname(statePath), { recursive: true });
+    await fsp.writeFile(statePath, JSON.stringify(this._serializeState(), null, 2));
+  }
+
+  _saveSync() {
+    const statePath = this._resolveStatePath();
+
+    try {
+      fs.mkdirSync(path.dirname(statePath), { recursive: true });
+      fs.writeFileSync(statePath, JSON.stringify(this._serializeState(), null, 2));
+    } catch (error) {
+      log.warn("auth provider sync flush failed", {
+        path: statePath,
+        error: error && error.message ? error.message : String(error)
+      });
+    }
+  }
+
+  _serializeState() {
+    return {
+      invalidAccounts: Object.fromEntries(this._invalidAccounts),
+      lastFailures: Object.fromEntries(this._lastFailures)
+    };
+  }
+
+  save() {
+    this._scheduleSave();
+  }
+
+  flushSync() {
+    if (this._saveTimer) {
+      clearTimeout(this._saveTimer);
+      this._saveTimer = null;
+    }
+
+    this._saveSync();
   }
 
   _resolveToken(account) {
@@ -171,7 +291,23 @@ class AuthProvider {
   }
 
   getInvalidUntil(accountId) {
-    return this._invalidAccounts.get(String(accountId)) || null;
+    if (!accountId) {
+      return null;
+    }
+
+    const normalizedId = String(accountId);
+    const invalidUntil = this._invalidAccounts.get(normalizedId) || 0;
+
+    if (invalidUntil > Date.now()) {
+      return invalidUntil;
+    }
+
+    if (invalidUntil) {
+      this._invalidAccounts.delete(normalizedId);
+      this.save();
+    }
+
+    return null;
   }
 
   getLastFailure(accountId) {
@@ -192,7 +328,7 @@ class AuthProvider {
       return false;
     }
 
-    const invalidUntil = this._invalidAccounts.get(account.id) || 0;
+    const invalidUntil = this.getInvalidUntil(account.id) || 0;
     return invalidUntil <= Date.now();
   }
 
@@ -296,6 +432,7 @@ class AuthProvider {
 
     if (untilMs != null && Number.isFinite(Number(untilMs)) && Number(untilMs) <= Date.now()) {
       this._invalidAccounts.delete(String(accountId));
+      this.save();
       return;
     }
 
@@ -310,6 +447,8 @@ class AuthProvider {
         reason: String(reason)
       });
     }
+
+    this.save();
   }
 
   invalidateAccountUntil(accountId, untilMs, reason = null) {
@@ -325,6 +464,7 @@ class AuthProvider {
       at: new Date().toISOString(),
       reason: error && error.message ? error.message : String(error)
     });
+    this.save();
   }
 
   clearFailure(accountId) {
@@ -333,6 +473,7 @@ class AuthProvider {
     }
 
     this._lastFailures.delete(String(accountId));
+    this.save();
   }
 
   clearInvalidation(accountId) {
@@ -341,6 +482,7 @@ class AuthProvider {
     }
 
     this._invalidAccounts.delete(String(accountId));
+    this.save();
   }
 
   getSummary() {
@@ -358,7 +500,8 @@ class AuthProvider {
         .filter((account) => this._isAccountUsable(account))
         .map((account) => account.id),
       lastFailures: Object.fromEntries(this._lastFailures),
-      invalidAccounts: Object.fromEntries(this._invalidAccounts)
+      invalidAccounts: Object.fromEntries(this._invalidAccounts),
+      authStatePath: this._resolveStatePath()
     };
   }
 }

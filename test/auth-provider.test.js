@@ -95,6 +95,74 @@ test("AuthProvider invalidates account until a specific refresh time", () => {
   assert.equal(provider.resolveCredential().accountId, "acct_a");
 });
 
+test("AuthProvider persists invalidation cooldown across restart", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "accio-auth-provider-"));
+  const filePath = path.join(tempDir, "accounts.json");
+  const statePath = path.join(tempDir, "auth-provider-state.json");
+
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify({
+      strategy: "fixed",
+      accounts: [{ id: "acct_a", accessToken: "token_a", enabled: true }]
+    })
+  );
+
+  const provider = new AuthProvider({
+    authMode: "file",
+    accountsPath: filePath,
+    authStatePath: statePath
+  });
+
+  provider.invalidateAccountUntil("acct_a", Date.now() + 60 * 1000, "quota refresh pending");
+  provider.flushSync();
+
+  const restarted = new AuthProvider({
+    authMode: "file",
+    accountsPath: filePath,
+    authStatePath: statePath
+  });
+
+  assert.equal(restarted.resolveCredential(), null);
+  assert.ok(restarted.getInvalidUntil("acct_a"));
+});
+
+test("AuthProvider drops expired persisted invalidation on load", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "accio-auth-provider-"));
+  const filePath = path.join(tempDir, "accounts.json");
+  const statePath = path.join(tempDir, "auth-provider-state.json");
+
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify({
+      strategy: "fixed",
+      accounts: [{ id: "acct_a", accessToken: "token_a", enabled: true }]
+    })
+  );
+
+  fs.writeFileSync(
+    statePath,
+    JSON.stringify({
+      invalidAccounts: { acct_a: Date.now() - 1000 },
+      lastFailures: {
+        acct_a: {
+          at: new Date().toISOString(),
+          reason: "expired"
+        }
+      }
+    })
+  );
+
+  const provider = new AuthProvider({
+    authMode: "file",
+    accountsPath: filePath,
+    authStatePath: statePath
+  });
+
+  assert.equal(provider.resolveCredential().accountId, "acct_a");
+  assert.equal(provider.getInvalidUntil("acct_a"), null);
+});
+
 
 test("AuthProvider prefers activeAccount over round robin", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "accio-auth-provider-"));

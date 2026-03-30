@@ -71,6 +71,10 @@ function createConfig() {
       "ACCIO_SESSION_STORE_PATH",
       path.join(process.cwd(), ".data", "sessions.json")
     ),
+    authStatePath: env(
+      "ACCIO_AUTH_STATE_PATH",
+      path.join(process.cwd(), ".data", "auth-provider-state.json")
+    ),
     maxRetries: Number(env("ACCIO_MAX_RETRIES", "2")),
     retryBaseMs: Number(env("ACCIO_RETRY_BASE_MS", "250")),
     retryMaxDelayMs: Number(env("ACCIO_RETRY_MAX_DELAY_MS", "2500")),

@@ -411,6 +411,7 @@ async function main() {
 
     shuttingDown = true;
     log.info("shutdown requested", { signal });
+    authProvider.flushSync();
     sessionStore.flushSync();
 
     server.close(() => {
