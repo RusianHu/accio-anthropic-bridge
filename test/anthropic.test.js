@@ -10,6 +10,7 @@ const {
   normalizeContent,
   normalizeSystemPrompt
 } = require("../src/anthropic");
+const { selectAnthropicTransport } = require("../src/routes/anthropic");
 
 test("normalizeSystemPrompt handles string and text blocks", () => {
   assert.equal(normalizeSystemPrompt("system text"), "system text");
@@ -72,4 +73,45 @@ test("buildMessageResponse emits tool_use blocks and stop reason", () => {
   assert.equal(response.stop_reason, "tool_use");
   assert.equal(response.content[0].type, "tool_use");
   assert.deepEqual(response.accio.tool_results, [{ tool_use_id: "call_1", content: "hi" }]);
+});
+
+test("selectAnthropicTransport prefers external fallback over local-ws when thinking needs direct transport", () => {
+  const decision = selectAnthropicTransport({
+    body: {
+      model: "claude-sonnet-4-6",
+      thinking: { type: "enabled" },
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }]
+    },
+    client: { config: { transportMode: "auto" } },
+    directAllowed: false,
+    fallbackClient: {
+      protocol: "anthropic",
+      isEligibleAnthropic() {
+        return true;
+      }
+    },
+    thinking: { type: "enabled" }
+  });
+
+  assert.equal(decision.transportSelected, "external-anthropic");
+  assert.equal(decision.useExternalFallback, true);
+  assert.equal(decision.unsupportedThinking, false);
+});
+
+test("selectAnthropicTransport marks thinking unsupported when neither direct nor external anthropic fallback is available", () => {
+  const decision = selectAnthropicTransport({
+    body: {
+      model: "claude-sonnet-4-6",
+      thinking: { type: "enabled" },
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }]
+    },
+    client: { config: { transportMode: "auto" } },
+    directAllowed: false,
+    fallbackClient: null,
+    thinking: { type: "enabled" }
+  });
+
+  assert.equal(decision.transportSelected, "unsupported");
+  assert.equal(decision.useExternalFallback, false);
+  assert.equal(decision.unsupportedThinking, true);
 });

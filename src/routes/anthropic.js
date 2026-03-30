@@ -60,6 +60,49 @@ function fallbackTransportName(fallbackClient) {
     : "external-openai";
 }
 
+function selectAnthropicTransport({ body, client, directAllowed, fallbackClient, thinking }) {
+  const fallbackTransport = fallbackTransportName(fallbackClient);
+  const externalEligible = Boolean(
+    fallbackClient &&
+    typeof fallbackClient.isEligibleAnthropic === "function" &&
+    fallbackClient.isEligibleAnthropic(body)
+  );
+
+  if (directAllowed) {
+    return {
+      transportSelected: "direct-llm",
+      directAllowed: true,
+      useExternalFallback: false,
+      unsupportedThinking: false
+    };
+  }
+
+  if (thinking) {
+    if (externalEligible) {
+      return {
+        transportSelected: fallbackTransport,
+        directAllowed: false,
+        useExternalFallback: true,
+        unsupportedThinking: false
+      };
+    }
+
+    return {
+      transportSelected: "unsupported",
+      directAllowed: false,
+      useExternalFallback: false,
+      unsupportedThinking: true
+    };
+  }
+
+  return {
+    transportSelected: "local-ws",
+    directAllowed: false,
+    useExternalFallback: false,
+    unsupportedThinking: false
+  };
+}
+
 function extractAnthropicPayloadText(payload) {
   const content = Array.isArray(payload && payload.content) ? payload.content : [];
   return content
@@ -528,23 +571,38 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackCli
   }
 
   const directAllowed = await shouldUseDirectTransport(client, directClient);
+  const transportDecision = selectAnthropicTransport({
+    body,
+    client,
+    directAllowed,
+    fallbackClient,
+    thinking
+  });
   logRequest(req, "anthropic transport selected", {
-    transportSelected: directAllowed ? "direct-llm" : "local-ws",
+    transportSelected: transportDecision.transportSelected,
     configuredTransport: client.config.transportMode,
     requestedModel: body.model || null,
     normalizedModel: directRequest.model
   });
   updateTrace(req, {
     bridge: {
-      transportSelected: directAllowed ? "direct-llm" : "local-ws"
+      transportSelected: transportDecision.transportSelected
     }
   });
 
-  if (thinking && !directAllowed) {
+  if (transportDecision.useExternalFallback) {
+    await tryExternalFallbackAnthropic(body, req, res, fallbackClient, binding, directRequest, {
+      cacheKey,
+      responseCache
+    }, createBridgeError(429, "direct-llm unavailable for thinking; using external fallback", "rate_limit_error"), "direct-unavailable");
+    return;
+  }
+
+  if (transportDecision.unsupportedThinking) {
     throw createBridgeError(501, "Thinking mode is only supported through direct-llm transport", "unsupported_error");
   }
 
-  if (directAllowed) {
+  if (transportDecision.directAllowed) {
     try {
       await runDirectAnthropic(body, req, res, directClient, sessionStore, storedSession, {
         cacheKey,
@@ -737,5 +795,6 @@ async function handleCountTokens(req, res) {
 
 module.exports = {
   handleCountTokens,
-  handleMessagesRequest
+  handleMessagesRequest,
+  selectAnthropicTransport
 };
