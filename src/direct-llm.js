@@ -820,6 +820,31 @@ class UpstreamSseError extends Error {
   }
 }
 
+function buildGatewayCooldownError(details = {}) {
+  const refreshUntilMs = Number(details.refreshUntilMs || 0);
+  const refreshCountdownSeconds = Number(details.refreshCountdownSeconds || 0);
+  const message = details.message || "quota exhausted (gateway cooling down until refresh)";
+  const error = new Error(message);
+  error.name = "GatewayQuotaCooldownError";
+  error.status = 429;
+  error.type = "rate_limit_error";
+  error.details = {
+    upstream: {
+      status: 429,
+      statusText: "Too Many Requests",
+      body: {
+        message,
+        source: "gateway-cooldown",
+        refreshUntilMs: Number.isFinite(refreshUntilMs) && refreshUntilMs > 0 ? refreshUntilMs : null,
+        refreshCountdownSeconds: Number.isFinite(refreshCountdownSeconds) && refreshCountdownSeconds > 0
+          ? refreshCountdownSeconds
+          : null
+      }
+    }
+  };
+  return error;
+}
+
 class DirectLlmClient {
   constructor(config) {
     this.config = config;
@@ -835,6 +860,9 @@ class DirectLlmClient {
     this._quotaPreflightEnabled = config.quotaPreflightEnabled !== false;
     this._quotaCacheTtlMs = Number(config.quotaCacheTtlMs || 30 * 1000);
     this._quotaCache = new Map();
+    this._gatewayQuotaInvalidUntil = 0;
+    this._gatewayQuotaReason = null;
+    this._gatewayQuota = null;
     this._utdid = readAccioUtdid(config.accioHome);
   }
 
@@ -886,6 +914,17 @@ class DirectLlmClient {
       }
     }
 
+    if (authMode === "auto") {
+      const gatewayCooldown = this._getGatewayQuotaCooldown();
+      if (gatewayCooldown.coolingDown) {
+        throw buildGatewayCooldownError({
+          message: gatewayCooldown.reason || "quota exhausted (gateway cooling down until refresh)",
+          refreshUntilMs: gatewayCooldown.invalidUntil,
+          refreshCountdownSeconds: gatewayCooldown.refreshCountdownSeconds
+        });
+      }
+    }
+
     return {
       accountId: null,
       accountName: null,
@@ -933,8 +972,82 @@ class DirectLlmClient {
     return Date.now() + (Math.max(1, Math.floor(seconds)) * 1000);
   }
 
+  _clearGatewayQuotaCooldown() {
+    this._gatewayQuotaInvalidUntil = 0;
+    this._gatewayQuotaReason = null;
+    this._gatewayQuota = null;
+  }
+
+  _setGatewayQuotaCooldown(quota, reason) {
+    const refreshUntilMs = this._getQuotaRefreshUntilMs(quota);
+    this._gatewayQuotaInvalidUntil = Number.isFinite(refreshUntilMs) && refreshUntilMs > 0 ? refreshUntilMs : 0;
+    this._gatewayQuotaReason = reason || "quota exhausted (gateway cooling down until refresh)";
+    this._gatewayQuota = quota || null;
+  }
+
+  _getGatewayQuotaCooldown() {
+    if (!Number.isFinite(this._gatewayQuotaInvalidUntil) || this._gatewayQuotaInvalidUntil <= 0) {
+      return {
+        coolingDown: false,
+        invalidUntil: 0,
+        reason: null,
+        refreshCountdownSeconds: null
+      };
+    }
+
+    if (this._gatewayQuotaInvalidUntil <= Date.now()) {
+      this._clearGatewayQuotaCooldown();
+      return {
+        coolingDown: false,
+        invalidUntil: 0,
+        reason: null,
+        refreshCountdownSeconds: null
+      };
+    }
+
+    return {
+      coolingDown: true,
+      invalidUntil: this._gatewayQuotaInvalidUntil,
+      reason: this._gatewayQuotaReason,
+      refreshCountdownSeconds: Math.max(1, Math.ceil((this._gatewayQuotaInvalidUntil - Date.now()) / 1000))
+    };
+  }
+
+  _rememberGatewayQuotaFailure(error) {
+    if (!error || String(this.config.authMode || "auto") !== "auto") {
+      return;
+    }
+
+    const current = this._getGatewayQuotaCooldown();
+    if (current.coolingDown) {
+      return;
+    }
+
+    const message = String(error.message || "").toLowerCase();
+    if (!(Number(error.status || 0) === 429 || /quota/.test(message))) {
+      return;
+    }
+
+    const refreshCountdownSeconds =
+      Number(
+        error &&
+        error.details &&
+        error.details.upstream &&
+        error.details.upstream.body &&
+        (
+          error.details.upstream.body.refreshCountdownSeconds ||
+          (error.details.upstream.body.data && error.details.upstream.body.data.refreshCountdownSeconds)
+        )
+      ) || Math.max(30, Math.ceil(this._quotaCacheTtlMs / 1000));
+
+    this._setGatewayQuotaCooldown(
+      { refreshCountdownSeconds },
+      error.message || "quota exhausted (gateway cooling down until refresh)"
+    );
+  }
+
   async fetchQuotaStatus(auth) {
-    if (!this._quotaPreflightEnabled || !auth || !auth.accountId || !auth.token || !auth.cookie) {
+    if (!this._quotaPreflightEnabled || !auth || !auth.token) {
       return null;
     }
 
@@ -976,7 +1089,7 @@ class DirectLlmClient {
   }
 
   async shouldSkipAccountByQuota(auth, options = {}) {
-    if (!this._quotaPreflightEnabled || !auth || !auth.accountId || options.explicitAccountId) {
+    if (!this._quotaPreflightEnabled || !auth || options.explicitAccountId) {
       return { skip: false, quota: null };
     }
 
@@ -998,7 +1111,24 @@ class DirectLlmClient {
     }
 
     const usagePercent = Number(quota && quota.usagePercent);
-    if (!Number.isFinite(usagePercent) || usagePercent < 100 || !this.authProvider) {
+    if (!Number.isFinite(usagePercent) || usagePercent < 100) {
+      if (auth.source === "gateway") {
+        this._clearGatewayQuotaCooldown();
+      }
+      return { skip: false, quota };
+    }
+
+    if (auth.source === "gateway") {
+      const gatewayReason = "quota exhausted (gateway cooling down until refresh)";
+      this._setGatewayQuotaCooldown(quota, gatewayReason);
+      return {
+        skip: String(this.config.authMode || "auto") === "auto",
+        quota,
+        gateway: true
+      };
+    }
+
+    if (!this.authProvider) {
       return { skip: false, quota };
     }
 
@@ -1213,6 +1343,14 @@ class DirectLlmClient {
         onDecision: options.onDecision
       });
 
+      if (quotaDecision.skip && auth.source === "gateway") {
+        throw buildGatewayCooldownError({
+          message: "quota exhausted (gateway cooling down until refresh)",
+          refreshUntilMs: this._gatewayQuotaInvalidUntil,
+          refreshCountdownSeconds: quotaDecision.quota && quotaDecision.quota.refreshCountdownSeconds
+        });
+      }
+
       if (quotaDecision.skip && auth.accountId && this.authProvider) {
         const usagePercent = quotaDecision.quota && Number.isFinite(Number(quotaDecision.quota.usagePercent))
           ? Number(quotaDecision.quota.usagePercent)
@@ -1283,6 +1421,10 @@ class DirectLlmClient {
           this.clearTokenCache();
         }
 
+        if (auth.source === "gateway") {
+          this._rememberGatewayQuotaFailure(upstreamError);
+        }
+
         if (auth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
           this.authProvider.recordFailure(auth.accountId, upstreamError);
         }
@@ -1334,6 +1476,10 @@ class DirectLlmClient {
       }
 
       if (state.error) {
+        if (auth.source === "gateway") {
+          this._rememberGatewayQuotaFailure(state.error);
+        }
+
         if (auth.accountId && this.authProvider && typeof this.authProvider.recordFailure === "function") {
           this.authProvider.recordFailure(auth.accountId, state.error);
         }
@@ -1374,6 +1520,10 @@ class DirectLlmClient {
         if (typeof this.authProvider.clearInvalidation === "function") {
           this.authProvider.clearInvalidation(auth.accountId);
         }
+      }
+
+      if (auth.source === "gateway") {
+        this._clearGatewayQuotaCooldown();
       }
 
       return {

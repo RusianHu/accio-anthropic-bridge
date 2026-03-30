@@ -465,6 +465,102 @@ test("DirectLlmClient cools down a saturated account until refresh time instead 
   assert.ok((invalidUntilById.get('acct_full') || 0) > Date.now());
 });
 
+test("DirectLlmClient cools down gateway auth after quota precheck and skips later direct attempts", async () => {
+  let gatewayTokenRequests = 0;
+  let quotaRequests = 0;
+  let generateRequests = 0;
+
+  const fetchImpl = async (url) => {
+    const value = String(url);
+
+    if (value.includes('/api/entitlement/quota')) {
+      quotaRequests++;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            success: true,
+            data: {
+              usagePercent: 100,
+              refreshCountdownSeconds: 3600
+            }
+          };
+        }
+      };
+    }
+
+    if (value.endsWith('/models')) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        async json() {
+          return {
+            data: [
+              { provider: 'claude', modelList: [{ modelName: 'claude-opus-4-6', visible: true }] }
+            ]
+          };
+        }
+      };
+    }
+
+    if (value.includes('/generateContent')) {
+      generateRequests++;
+      throw new Error('generateContent should be skipped while gateway quota is exhausted');
+    }
+
+    throw new Error('Unexpected URL: ' + value);
+  };
+
+  const client = new DirectLlmClient({
+    authMode: 'auto',
+    authProvider: {
+      resolveCredential() {
+        return null;
+      }
+    },
+    gatewayManager: {
+      async resolveAccessToken() {
+        gatewayTokenRequests++;
+        return {
+          token: 'gateway_token',
+          source: 'gateway'
+        };
+      }
+    },
+    requestTimeoutMs: 1000,
+    quotaPreflightEnabled: true,
+    quotaCacheTtlMs: 30000,
+    modelsCacheTtlMs: 1000,
+    localGatewayBaseUrl: 'http://127.0.0.1:4097',
+    upstreamBaseUrl: 'https://example.test/api/adk/llm',
+    fetchImpl
+  });
+
+  await assert.rejects(
+    () => client.run({ model: 'claude-opus-4-6', requestBody: { model: 'claude-opus-4-6' } }),
+    (error) => {
+      assert.equal(error.status, 429);
+      assert.match(error.message, /gateway cooling down|quota exhausted/i);
+      return true;
+    }
+  );
+
+  await assert.rejects(
+    () => client.run({ model: 'claude-opus-4-6', requestBody: { model: 'claude-opus-4-6' } }),
+    (error) => {
+      assert.equal(error.status, 429);
+      assert.match(error.message, /gateway cooling down|quota exhausted/i);
+      return true;
+    }
+  );
+
+  assert.equal(gatewayTokenRequests, 1);
+  assert.equal(quotaRequests, 1);
+  assert.equal(generateRequests, 0);
+});
+
 test("DirectLlmClient does not quota-skip an explicitly requested account", async () => {
   const seen = [];
   const authProvider = {
