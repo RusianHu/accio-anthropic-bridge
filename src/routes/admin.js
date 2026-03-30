@@ -7,7 +7,7 @@ const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 
 const { readJsonBody } = require("../middleware/body-parser");
-const { writeJson, CORS_HEADERS } = require("../http");
+const { writeJson, writeSse, CORS_HEADERS } = require("../http");
 const { parseEnvValue } = require("../env-file");
 const {
   detectActiveStorage,
@@ -2078,6 +2078,9 @@ const desktopBridge = typeof window !== 'undefined' && window.accioBridgeDesktop
 const isElectronShell = String(navigator.userAgent || '').includes('Electron/') || Boolean(desktopBridge);
 let messageTimer = null;
 let configMessageTimer = null;
+let currentTab = 'accounts';
+let refreshInFlight = null;
+let stateStream = null;
 const MSG_ICONS = { info: 'ℹ️', ok: '✅', warn: '⚠️', error: '❌' };
 function setScopedMessage(target, type, text, scope) {
   if (!target) {
@@ -2123,6 +2126,7 @@ function clearConfigMessage() {
 }
 function switchTab(tab) {
   const active = tab === 'settings' ? 'settings' : 'accounts';
+  currentTab = active;
   tabButtons.forEach((button) => {
     button.classList.toggle('active', button.getAttribute('data-tab') === active);
   });
@@ -2344,7 +2348,7 @@ function renderSnapshots(data) {
       + '</div>';
   }).join('');
 }
-function renderState(data) {
+function renderState(data, options = {}) {
   const recentActivity = data && data.recentActivity ? data.recentActivity : null;
   const [dotClass, summary] = recentActivityBadge(recentActivity, data.gateway);
   const [, gatewaySummary] = badgeState(data.gateway);
@@ -2363,12 +2367,26 @@ function renderState(data) {
   ]);
   renderCurrentAccountNote(data);
   renderSnapshots(data);
-  renderSettings(data);
+  if (options.allowSettings !== false) {
+    renderSettings(data);
+  }
 }
 async function refreshState(message) {
-  const payload = await api('/admin/api/state');
-  renderState(payload);
-  if (message) setMessage('ok', message);
+  if (!refreshInFlight) {
+    refreshInFlight = (async () => {
+      const payload = await api('/admin/api/state');
+      renderState(payload);
+      return payload;
+    })();
+  }
+
+  try {
+    const payload = await refreshInFlight;
+    if (message) setMessage('ok', message);
+    return payload;
+  } finally {
+    refreshInFlight = null;
+  }
 }
 async function withAction(button, fn) {
   const prev = button.textContent;
@@ -2485,8 +2503,37 @@ async function observeAccountLogin(flowId) {
 tabButtons.forEach((button) => {
   button.addEventListener('click', () => {
     switchTab(button.getAttribute('data-tab'));
+    if (currentTab === 'accounts') {
+      refreshState().catch(() => {});
+    }
   });
 });
+
+function connectStateStream() {
+  if (typeof EventSource === 'undefined') {
+    return;
+  }
+
+  if (stateStream) {
+    stateStream.close();
+  }
+
+  stateStream = new EventSource('/admin/api/events');
+  stateStream.addEventListener('state', (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      renderState(payload, { allowSettings: currentTab !== 'settings' });
+    } catch (_) {}
+  });
+  stateStream.addEventListener('state_error', (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      if (currentTab === 'accounts') {
+        setMessage('error', (payload && payload.message) || '状态流更新失败。');
+      }
+    } catch (_) {}
+  });
+}
 
 els.refreshBtn.addEventListener('click', async () => {
   els.refreshBtn.classList.add('spinning');
@@ -2657,6 +2704,7 @@ try {
   switchTab('accounts');
 }
 
+connectStateStream();
 refreshState().catch((error) => setMessage('error', error.message || String(error)));
 </script>
 </body>
@@ -2670,6 +2718,73 @@ async function handleAdminPage(req, res, config) {
 
 async function handleAdminState(req, res, config, authProvider, recentActivityStore) {
   writeJson(res, 200, await buildAdminState(config, authProvider, recentActivityStore));
+}
+
+async function handleAdminEvents(req, res, config, authProvider, recentActivityStore) {
+  res.writeHead(200, {
+    ...CORS_HEADERS,
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no"
+  });
+
+  let closed = false;
+  let sending = false;
+
+  const sendState = async () => {
+    if (closed || sending || res.writableEnded || res.destroyed) {
+      return;
+    }
+
+    sending = true;
+    try {
+      const payload = await buildAdminState(config, authProvider, recentActivityStore);
+      if (!closed && !res.writableEnded && !res.destroyed) {
+        writeSse(res, "state", payload);
+      }
+    } catch (error) {
+      if (!closed && !res.writableEnded && !res.destroyed) {
+        writeSse(res, "state_error", {
+          message: error && error.message ? error.message : String(error)
+        });
+      }
+    } finally {
+      sending = false;
+    }
+  };
+
+  const unsubscribeRecentActivity = recentActivityStore && typeof recentActivityStore.subscribe === "function"
+    ? recentActivityStore.subscribe(() => {
+        sendState().catch(() => {});
+      })
+    : () => {};
+
+  const stateTimer = setInterval(() => {
+    sendState().catch(() => {});
+  }, QUOTA_CACHE_TTL_MS);
+  const pingTimer = setInterval(() => {
+    if (!closed && !res.writableEnded && !res.destroyed) {
+      writeSse(res, "ping", { ts: new Date().toISOString() });
+    }
+  }, 10000);
+
+  const cleanup = () => {
+    if (closed) {
+      return;
+    }
+
+    closed = true;
+    clearInterval(stateTimer);
+    clearInterval(pingTimer);
+    unsubscribeRecentActivity();
+  };
+
+  req.on("close", cleanup);
+  req.on("aborted", cleanup);
+  res.on("close", cleanup);
+
+  await sendState();
 }
 
 async function handleAdminConfigGet(req, res, config) {
@@ -3292,6 +3407,7 @@ async function handleAdminAccountLoginStatus(req, res, config, url) {
 module.exports = {
   handleAdminPage,
   handleAdminState,
+  handleAdminEvents,
   handleAdminConfigGet,
   handleAdminConfigTest,
   handleAdminConfigSave,
