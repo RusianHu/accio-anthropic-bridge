@@ -19,6 +19,7 @@ const {
   writeSnapshotAuthPayload
 } = require("../auth-state");
 const { writeAccountToFile, findStoredAccountAuthPayload } = require("../accounts-file");
+const { extractAccessToken } = require("../gateway-manager");
 const log = require("../logger");
 
 const execFileAsync = promisify(execFile);
@@ -261,6 +262,111 @@ function extractCnaFromCookie(rawCookie) {
   const text = String(rawCookie);
   const match = text.match(/(?:^|%3B\s*|;\s*)cna(?:=|%3D)([^;%]+)/i);
   return match ? decodeURIComponent(match[1]) : "";
+}
+
+function extractPhoenixUrlQueryValue(payload, key) {
+  const url = payload && payload.data && payload.data.phoenix && payload.data.phoenix.url;
+
+  if (!url || !key) {
+    return "";
+  }
+
+  try {
+    return new URL(String(url)).searchParams.get(String(key)) || "";
+  } catch {
+    return "";
+  }
+}
+
+async function readGatewayWsStatus(baseUrl, timeoutMs = 5000) {
+  const normalized = String(baseUrl || "http://127.0.0.1:4097").replace(/\/$/, "");
+  const response = await fetch(`${normalized}/debug/auth/ws-status`, {
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+  const text = await response.text();
+  const payload = text ? JSON.parse(text) : {};
+
+  if (!response.ok) {
+    const error = new Error(`Gateway request failed for /debug/auth/ws-status: ${response.status}`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+
+  return payload;
+}
+
+async function fetchAdminQuota(config, gateway) {
+  const fetchedAtMs = Date.now();
+  const fetchedAt = new Date(fetchedAtMs).toISOString();
+
+  if (!gateway || !gateway.reachable) {
+    return {
+      ok: false,
+      source: "upstream-entitlement",
+      fetchedAt,
+      error: "gateway_unreachable"
+    };
+  }
+
+  if (!gateway.authenticated) {
+    return {
+      ok: false,
+      source: "upstream-entitlement",
+      fetchedAt,
+      error: "gateway_not_authenticated"
+    };
+  }
+
+  try {
+    const wsStatus = await readGatewayWsStatus(config.baseUrl, 5000);
+    const accessToken = extractAccessToken(wsStatus) || extractPhoenixUrlQueryValue(wsStatus, "accessToken");
+    const utdid = readAccioUtdid(config) || extractPhoenixUrlQueryValue(wsStatus, "utdid");
+
+    if (!accessToken) {
+      throw new Error("No access token available from gateway ws-status");
+    }
+
+    const quotaUrl = new URL("/api/entitlement/quota", deriveUpstreamGatewayBaseUrl(config));
+    quotaUrl.searchParams.set("accessToken", accessToken);
+    if (utdid) {
+      quotaUrl.searchParams.set("utdid", utdid);
+    }
+
+    const response = await fetch(quotaUrl, {
+      signal: AbortSignal.timeout(10000)
+    });
+    const text = await response.text();
+    const payload = text ? JSON.parse(text) : {};
+
+    if (!response.ok || !payload || payload.success !== true || !payload.data) {
+      const message = payload && payload.message ? String(payload.message) : `HTTP ${response.status}`;
+      throw new Error(`Quota request failed: ${message}`);
+    }
+
+    const usagePercent = Number(payload.data.usagePercent);
+    const refreshCountdownSeconds = Number(payload.data.refreshCountdownSeconds);
+    const refreshAtMs = Number.isFinite(refreshCountdownSeconds) && refreshCountdownSeconds >= 0
+      ? fetchedAtMs + refreshCountdownSeconds * 1000
+      : null;
+
+    return {
+      ok: true,
+      source: "upstream-entitlement",
+      fetchedAt,
+      usagePercent: Number.isFinite(usagePercent) ? usagePercent : null,
+      refreshCountdownSeconds: Number.isFinite(refreshCountdownSeconds) ? refreshCountdownSeconds : null,
+      refreshAtMs,
+      refreshAt: refreshAtMs ? new Date(refreshAtMs).toISOString() : null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      source: "upstream-entitlement",
+      fetchedAt,
+      error: error instanceof Error && error.message ? error.message : String(error)
+    };
+  }
 }
 
 async function refreshAuthPayloadViaUpstream(config, authPayload, context = {}) {
@@ -785,6 +891,7 @@ async function restartAccioForSnapshot(config, expectedUserId, options = {}) {
 
 async function buildAdminState(config, authProvider) {
   const gateway = await readGatewayState(config.baseUrl);
+  const quota = await fetchAdminQuota(config, gateway);
   const storage = detectActiveStorage();
   const snapshots = listSnapshots().map((entry) => {
     const storedAuthPayload = !entry.hasAuthCallback
@@ -846,6 +953,7 @@ async function buildAdminState(config, authProvider) {
       appPath: config.appPath
     },
     gateway,
+    quota,
     storage,
     snapshots,
     currentSnapshot,
@@ -1049,11 +1157,91 @@ button { font: inherit; cursor: pointer; }
 .dot.good { background: var(--good); animation: pulse 2s ease-in-out infinite; }
 .dot.warn { background: var(--warn); animation: pulseWarn 2s ease-in-out infinite; }
 .dot.bad { background: var(--bad); }
+.quotaCard {
+  margin-top: 10px;
+  padding: 12px 12px 10px;
+  border-radius: 18px;
+  background: rgba(255,255,255,0.96);
+  border: 1px solid rgba(24,22,20,0.1);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.9), 0 6px 18px rgba(56,40,28,0.06);
+}
+.quotaCard.is-empty {
+  background: rgba(255,255,255,0.82);
+}
+.quotaHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.quotaTitleWrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.quotaIcon {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid rgba(24,22,20,0.08);
+  background: rgba(24,22,20,0.03);
+  color: #4e4740;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.quotaTitle {
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.quotaMeta {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+.quotaProgress {
+  position: relative;
+  margin-top: 10px;
+  height: 14px;
+  border-radius: 999px;
+  overflow: hidden;
+  background:
+    repeating-linear-gradient(90deg, rgba(24,22,20,0.08) 0 4px, transparent 4px 6px),
+    linear-gradient(180deg, rgba(24,22,20,0.03) 0%, rgba(24,22,20,0.06) 100%);
+}
+.quotaProgressFill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 0%;
+  border-radius: inherit;
+  background:
+    repeating-linear-gradient(90deg, #1ec768 0 4px, transparent 4px 6px),
+    linear-gradient(90deg, #18b65c 0%, #35d77d 100%);
+  box-shadow: inset 0 0 0 1px rgba(16,128,64,0.08);
+  transition: width 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.quotaCard.is-empty .quotaProgressFill {
+  background:
+    repeating-linear-gradient(90deg, rgba(138,130,121,0.35) 0 4px, transparent 4px 6px),
+    linear-gradient(90deg, rgba(138,130,121,0.25) 0%, rgba(138,130,121,0.18) 100%);
+}
 .kv {
   display: grid;
   grid-template-columns: 88px 1fr;
   gap: 4px 8px;
-  margin-top: 8px;
+  margin-top: 10px;
   font-size: 12px;
 }
 .kv dt { color: var(--muted); font-weight: 500; }
@@ -1408,6 +1596,18 @@ button { font: inherit; cursor: pointer; }
         <div class="statusBadge"><span class="dot" id="gateway-dot"></span><span id="gateway-summary">\u6B63\u5728\u68C0\u67E5\u672C\u5730\u7F51\u5173\u72B6\u6001</span></div>
         <button class="btn-icon" id="refresh-btn" title="\u5237\u65B0\u72B6\u6001">\u21BB</button>
       </div>
+      <div class="quotaCard is-empty" id="quota-card">
+        <div class="quotaHead">
+          <div class="quotaTitleWrap">
+            <span class="quotaIcon">\u21BB</span>
+            <span class="quotaTitle" id="quota-usage-text">\u989D\u5EA6\u4FE1\u606F\u52A0\u8F7D\u4E2D</span>
+          </div>
+        </div>
+        <div class="quotaProgress" aria-hidden="true">
+          <div class="quotaProgressFill" id="quota-progress-fill"></div>
+        </div>
+        <div class="quotaMeta" id="quota-meta">\u6B63\u5728\u8BFB\u53D6\u914D\u989D\u4E0E\u91CD\u7F6E\u65F6\u95F4\u2026</div>
+      </div>
       <dl class="kv" id="overview-kv"></dl>
     </aside>
     <aside class="panel actionPanel">
@@ -1437,6 +1637,10 @@ button { font: inherit; cursor: pointer; }
 const els = {
   gatewayDot: document.getElementById('gateway-dot'),
   gatewaySummary: document.getElementById('gateway-summary'),
+  quotaCard: document.getElementById('quota-card'),
+  quotaUsageText: document.getElementById('quota-usage-text'),
+  quotaMeta: document.getElementById('quota-meta'),
+  quotaProgressFill: document.getElementById('quota-progress-fill'),
   overviewKv: document.getElementById('overview-kv'),
   snapshotList: document.getElementById('snapshot-list'),
   actionMessage: document.getElementById('action-message'),
@@ -1474,6 +1678,61 @@ async function api(path, options = {}) {
 function formatTime(value) {
   if (!value) return '—';
   try { return new Date(value).toLocaleString(); } catch { return String(value); }
+}
+function formatDurationFromSeconds(value) {
+  const totalSeconds = Number(value);
+  if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return '—';
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = Math.floor(totalSeconds % 60);
+  const parts = [];
+  if (days > 0) parts.push(days + '天');
+  if (hours > 0 || parts.length > 0) parts.push(hours + '时');
+  if (minutes > 0 || parts.length > 0) parts.push(minutes + '分');
+  parts.push(seconds + '秒');
+  return parts.join(' ');
+}
+function formatQuotaUsage(quota) {
+  if (!quota || !quota.ok) return quota && quota.error ? '获取失败' : '—';
+  const usagePercent = Number(quota.usagePercent);
+  return Number.isFinite(usagePercent) ? usagePercent.toFixed(2) + ' %' : '—';
+}
+function formatQuotaCountdown(quota) {
+  if (!quota || !quota.ok) return quota && quota.error ? '获取失败' : '—';
+  return formatDurationFromSeconds(quota.refreshCountdownSeconds);
+}
+function quotaUsagePercentNumber(quota) {
+  const usagePercent = Number(quota && quota.usagePercent);
+  if (!Number.isFinite(usagePercent)) return null;
+  return Math.max(0, Math.min(100, usagePercent));
+}
+function renderQuotaCard(quota) {
+  if (!els.quotaCard || !els.quotaUsageText || !els.quotaMeta || !els.quotaProgressFill) {
+    return;
+  }
+
+  const usagePercent = quotaUsagePercentNumber(quota);
+  const hasQuota = Boolean(quota && quota.ok && usagePercent != null);
+  const remainingPercent = hasQuota ? Math.max(0, 100 - usagePercent) : 0;
+  const metaParts = [];
+
+  if (hasQuota && Number.isFinite(Number(quota.refreshCountdownSeconds))) {
+    metaParts.push('约 ' + formatQuotaCountdown(quota) + ' 后重置');
+  }
+
+  if (hasQuota && (quota.refreshAtMs || quota.refreshAt)) {
+    metaParts.push(formatTime(quota.refreshAtMs || quota.refreshAt) + ' 重置');
+  }
+
+  els.quotaCard.classList.toggle('is-empty', !hasQuota);
+  els.quotaUsageText.textContent = hasQuota
+    ? ('额度已使用 ' + usagePercent.toFixed(2) + ' %')
+    : '额度信息暂不可用';
+  els.quotaMeta.textContent = hasQuota
+    ? (metaParts.join(' · ') || '额度信息已同步')
+    : '暂时无法从本地网关读取配额信息';
+  els.quotaProgressFill.style.width = remainingPercent.toFixed(2) + '%';
 }
 function badgeState(gateway) {
   if (!gateway || !gateway.reachable) return ['bad', '网关不可达'];
@@ -1566,6 +1825,7 @@ function renderState(data) {
   const [dotClass, summary] = badgeState(data.gateway);
   els.gatewayDot.className = 'dot ' + dotClass;
   els.gatewaySummary.textContent = summary + (data.gateway && data.gateway.user && data.gateway.user.id ? ' · ' + data.gateway.user.id : '');
+  renderQuotaCard(data.quota);
   renderKv(els.overviewKv, [
     ['当前用户', data.gateway && data.gateway.user ? ((data.gateway.user.id || 'unknown') + (data.gateway.user.name ? ' (' + data.gateway.user.name + ')' : '')) : '未登录'],
     ['已记录账号', String((data.snapshots || []).length)],
