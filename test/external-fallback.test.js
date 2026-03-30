@@ -6,7 +6,9 @@ const assert = require("node:assert/strict");
 const {
   DEFAULT_ANTHROPIC_VERSION,
   ExternalFallbackClient,
+  ExternalFallbackPool,
   anthropicToFallbackMessages,
+  normalizeFallbackTargets,
   openAiToFallbackMessages,
   shouldFallbackToExternalProvider
 } = require("../src/external-fallback");
@@ -56,6 +58,39 @@ test("ExternalFallbackClient eligibility rejects tools thinking and images", () 
   assert.equal(client.isEligibleOpenAi({ tools: [{ type: "function", function: { name: "tool" } }], messages: [] }), false);
   assert.equal(client.isEligibleOpenAi({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://x" } }] }] }), false);
   assert.equal(client.isEligibleOpenAi({ messages: [{ role: "user", content: "ok" }] }), true);
+});
+
+test("normalizeFallbackTargets preserves order and normalizes ids", () => {
+  const targets = normalizeFallbackTargets([
+    { name: "Primary", protocol: "anthropic", baseUrl: "https://a.example/v1/", apiKey: "k1", model: "m1" },
+    { name: "Secondary", protocol: "openai", baseUrl: "https://b.example/v1", apiKey: "k2", model: "m2", enabled: false }
+  ]);
+
+  assert.equal(targets.length, 1);
+  assert.equal(targets[0].name, "Primary");
+  assert.equal(targets[0].protocol, "anthropic");
+  assert.equal(targets[0].baseUrl, "https://a.example/v1");
+  assert.ok(targets[0].id);
+});
+
+test("ExternalFallbackPool returns eligible candidates in configured order", () => {
+  const pool = new ExternalFallbackPool({
+    targets: [
+      { id: "a", name: "A", protocol: "anthropic", baseUrl: "https://a.example/v1", apiKey: "k1", model: "m1" },
+      { id: "b", name: "B", protocol: "openai", baseUrl: "https://b.example/v1", apiKey: "k2", model: "m2" }
+    ]
+  });
+
+  const anthropicCandidates = pool.getEligibleAnthropic({
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    thinking: { type: "enabled" }
+  });
+  const openAiCandidates = pool.getEligibleOpenAi({
+    messages: [{ role: "user", content: "hi" }]
+  });
+
+  assert.deepEqual(anthropicCandidates.map((entry) => entry.target.id), ["a"]);
+  assert.deepEqual(openAiCandidates.map((entry) => entry.target.id), ["a", "b"]);
 });
 
 test("ExternalFallbackClient completes through OpenAI compatible endpoint", async () => {

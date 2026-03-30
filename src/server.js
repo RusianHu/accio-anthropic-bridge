@@ -7,7 +7,7 @@ const { AuthProvider } = require("./auth-provider");
 const { buildErrorResponse } = require("./anthropic");
 const { DebugTraceStore, setTraceError, updateTrace } = require("./debug-traces");
 const { DirectLlmClient } = require("./direct-llm");
-const { ExternalFallbackClient } = require("./external-fallback");
+const { ExternalFallbackPool } = require("./external-fallback");
 const { classifyErrorType } = require("./errors");
 const { GatewayManager } = require("./gateway-manager");
 const { CORS_HEADERS, writeJson } = require("./http");
@@ -102,7 +102,7 @@ function recordRecentActivity(activityStore, req, requestMeta, protocol, statusC
   }
 }
 
-function createServer(config, client, directClient, fallbackClient, authProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore, recentActivityStore) {
+function createServer(config, client, directClient, fallbackPool, authProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore, recentActivityStore) {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const startTime = Date.now();
@@ -208,7 +208,7 @@ function createServer(config, client, directClient, fallbackClient, authProvider
       }
 
       if (req.method === "POST" && url.pathname === "/admin/api/config") {
-        await handleAdminConfigSave(req, res, config, fallbackClient);
+        await handleAdminConfigSave(req, res, config, fallbackPool);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
         return;
       }
@@ -317,7 +317,7 @@ function createServer(config, client, directClient, fallbackClient, authProvider
       }
 
       if (req.method === "POST" && url.pathname === "/v1/messages") {
-        await handleMessagesRequest(req, res, client, directClient, fallbackClient, sessionStore, responseCache);
+        await handleMessagesRequest(req, res, client, directClient, fallbackPool, sessionStore, responseCache);
         captureTrace(traceStore, req, res, requestMeta, startTime);
         recordRecentActivity(recentActivityStore, req, requestMeta, "anthropic", res.statusCode || 200);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "anthropic" });
@@ -332,7 +332,7 @@ function createServer(config, client, directClient, fallbackClient, authProvider
       }
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-        await handleChatCompletionsRequest(req, res, client, directClient, fallbackClient, sessionStore, responseCache);
+        await handleChatCompletionsRequest(req, res, client, directClient, fallbackPool, sessionStore, responseCache);
         captureTrace(traceStore, req, res, requestMeta, startTime);
         recordRecentActivity(recentActivityStore, req, requestMeta, "openai", res.statusCode || 200);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "openai" });
@@ -340,7 +340,7 @@ function createServer(config, client, directClient, fallbackClient, authProvider
       }
 
       if (req.method === "POST" && url.pathname === "/v1/responses") {
-        await handleResponsesRequest(req, res, client, directClient, fallbackClient, sessionStore, responseCache);
+        await handleResponsesRequest(req, res, client, directClient, fallbackPool, sessionStore, responseCache);
         captureTrace(traceStore, req, res, requestMeta, startTime);
         recordRecentActivity(recentActivityStore, req, requestMeta, "openai-responses", res.statusCode || 200);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "openai-responses" });
@@ -427,13 +427,8 @@ async function main() {
     accioHome: config.accioHome,
     language: config.language
   });
-  const fallbackClient = new ExternalFallbackClient({
-    baseUrl: config.fallbackOpenAiBaseUrl,
-    apiKey: config.fallbackOpenAiApiKey,
-    model: config.fallbackOpenAiModel,
-    protocol: config.fallbackOpenAiProtocol,
-    anthropicVersion: config.fallbackAnthropicVersion,
-    timeoutMs: config.fallbackOpenAiTimeoutMs,
+  const fallbackPool = new ExternalFallbackPool({
+    targets: config.fallbackTargets || [],
     fetchImpl: fetch
   });
   const sessionStore = new SessionStore(config.sessionStorePath);
@@ -450,7 +445,7 @@ async function main() {
     maxStringLength: config.traceMaxBodyChars,
     sampleRate: config.traceSampleRate
   });
-  const server = createServer(config, client, directClient, fallbackClient, authProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore, recentActivityStore);
+  const server = createServer(config, client, directClient, fallbackPool, authProvider, gatewayManager, sessionStore, modelsRegistry, responseCache, traceStore, recentActivityStore);
 
   let shuttingDown = false;
 

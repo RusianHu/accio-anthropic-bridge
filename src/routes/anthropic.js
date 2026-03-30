@@ -60,13 +60,20 @@ function fallbackTransportName(fallbackClient) {
     : "external-openai";
 }
 
-function selectAnthropicTransport({ body, client, directAllowed, fallbackClient, thinking }) {
-  const fallbackTransport = fallbackTransportName(fallbackClient);
-  const externalEligible = Boolean(
-    fallbackClient &&
-    typeof fallbackClient.isEligibleAnthropic === "function" &&
-    fallbackClient.isEligibleAnthropic(body)
-  );
+function fallbackCandidatesForAnthropic(fallbackPool, body) {
+  if (!fallbackPool || typeof fallbackPool.getEligibleAnthropic !== "function") {
+    return [];
+  }
+
+  return fallbackPool.getEligibleAnthropic(body);
+}
+
+function selectAnthropicTransport({ body, client, directAllowed, fallbackPool, thinking }) {
+  const fallbackCandidates = fallbackCandidatesForAnthropic(fallbackPool, body);
+  const fallbackTransport = fallbackCandidates.length > 0
+    ? fallbackTransportName(fallbackCandidates[0].client)
+    : "external-openai";
+  const externalEligible = fallbackCandidates.length > 0;
 
   if (directAllowed) {
     return {
@@ -430,88 +437,103 @@ async function runDirectAnthropic(body, req, res, directClient, sessionStore, st
 }
 
 
-async function tryExternalFallbackAnthropic(body, req, res, fallbackClient, binding, directRequest, cacheState = {}, error = null, phase = null) {
-  if (!fallbackClient || !fallbackClient.isEligibleAnthropic(body) || !shouldFallbackToExternalProvider(error)) {
+async function tryExternalFallbackAnthropic(body, req, res, fallbackPool, binding, directRequest, cacheState = {}, error = null, phase = null) {
+  const candidates = fallbackCandidatesForAnthropic(fallbackPool, body);
+  if (candidates.length === 0 || !shouldFallbackToExternalProvider(error)) {
     return false;
   }
 
-  if (fallbackClient.protocol === "anthropic") {
-    return relayExternalAnthropicPassThrough(body, req, res, fallbackClient, binding, cacheState, error, phase);
-  }
+  let lastError = null;
+  for (const entry of candidates) {
+    const fallbackClient = entry.client;
+    try {
+      if (fallbackClient.protocol === "anthropic") {
+        return await relayExternalAnthropicPassThrough(body, req, res, fallbackClient, binding, cacheState, error, phase);
+      }
 
-  const transport = fallbackTransportName(fallbackClient);
+      const transport = fallbackTransportName(fallbackClient);
 
-  logRequest(req, "anthropic fallback to external provider", {
-    transportSelected: transport,
-    fallbackReason: error && error.message ? error.message : null,
-    phase,
-    fallbackModel: fallbackClient.model || null
-  });
-  updateTrace(req, {
-    bridge: {
-      transportSelected: transport,
-      fallbackModel: fallbackClient.model || null,
-      fallbackProtocol: fallbackClient.protocol || null
+      logRequest(req, "anthropic fallback to external provider", {
+        transportSelected: transport,
+        fallbackReason: error && error.message ? error.message : null,
+        phase,
+        fallbackModel: fallbackClient.model || null
+      });
+      updateTrace(req, {
+        bridge: {
+          transportSelected: transport,
+          fallbackModel: fallbackClient.model || null,
+          fallbackProtocol: fallbackClient.protocol || null
+        }
+      });
+
+      const result = await fallbackClient.completeAnthropic(body);
+      const inputTokens = estimateTokens(flattenAnthropicRequest(body));
+      const outputTokens = result.usage && Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
+        ? Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
+        : estimateTokens(result.text);
+      const promptTokens = result.usage && Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
+        ? Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
+        : inputTokens;
+      const baseHeaders = sessionHeaders({ sessionId: binding.sessionId || null });
+
+      if (binding.sessionId) {
+        req.bridgeContext = req.bridgeContext || {};
+      }
+
+      if (body.stream === true) {
+        const writer = new AnthropicStreamWriter({
+          estimateTokens,
+          inputTokens: promptTokens,
+          body,
+          res,
+          id: generateId("msg"),
+          sessionId: binding.sessionId || null
+        });
+
+        if (result.text) {
+          writer.writeTextDelta(result.text);
+        }
+
+        setTraceResponse(req, res, 200, null, { stream: true, fallbackTransport: transport });
+        writer.finishEndTurn(result.text || "", promptTokens);
+        return true;
+      }
+
+      const responseBody = buildMessageResponse(body, result.text || "", {
+        id: generateId("msg"),
+        inputTokens: promptTokens,
+        outputTokens,
+        sessionId: binding.sessionId || null
+      });
+
+      if (cacheState.cacheKey && cacheState.responseCache) {
+        cacheState.responseCache.set(cacheState.cacheKey, {
+          statusCode: 200,
+          body: responseBody,
+          headers: baseHeaders
+        });
+      }
+
+      setTraceResponse(req, res, 200, responseBody, {
+        cacheState: cacheState.cacheKey ? "miss" : null,
+        fallbackTransport: transport
+      });
+      writeJson(res, 200, responseBody, { ...baseHeaders, ...cacheHeaders("miss") });
+      return true;
+    } catch (candidateError) {
+      lastError = candidateError;
     }
-  });
-
-  const result = await fallbackClient.completeAnthropic(body);
-  const inputTokens = estimateTokens(flattenAnthropicRequest(body));
-  const outputTokens = result.usage && Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
-    ? Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
-    : estimateTokens(result.text);
-  const promptTokens = result.usage && Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
-    ? Number(result.usage.prompt_tokens || result.usage.input_tokens || 0)
-    : inputTokens;
-  const baseHeaders = sessionHeaders({ sessionId: binding.sessionId || null });
-
-  if (binding.sessionId) {
-    req.bridgeContext = req.bridgeContext || {};
   }
 
-  if (body.stream === true) {
-    const writer = new AnthropicStreamWriter({
-      estimateTokens,
-      inputTokens: promptTokens,
-      body,
-      res,
-      id: generateId("msg"),
-      sessionId: binding.sessionId || null
-    });
-
-    if (result.text) {
-      writer.writeTextDelta(result.text);
-    }
-
-    setTraceResponse(req, res, 200, null, { stream: true, fallbackTransport: transport });
-    writer.finishEndTurn(result.text || "", promptTokens);
-    return true;
+  if (lastError) {
+    throw lastError;
   }
 
-  const responseBody = buildMessageResponse(body, result.text || "", {
-    id: generateId("msg"),
-    inputTokens: promptTokens,
-    outputTokens,
-    sessionId: binding.sessionId || null
-  });
-
-  if (cacheState.cacheKey && cacheState.responseCache) {
-    cacheState.responseCache.set(cacheState.cacheKey, {
-      statusCode: 200,
-      body: responseBody,
-      headers: baseHeaders
-    });
-  }
-
-  setTraceResponse(req, res, 200, responseBody, {
-    cacheState: cacheState.cacheKey ? "miss" : null,
-    fallbackTransport: transport
-  });
-  writeJson(res, 200, responseBody, { ...baseHeaders, ...cacheHeaders("miss") });
-  return true;
+  return false;
 }
 
-async function handleMessagesRequest(req, res, client, directClient, fallbackClient, sessionStore, responseCache) {
+async function handleMessagesRequest(req, res, client, directClient, fallbackPool, sessionStore, responseCache) {
   const body = applyAnthropicDefaults(
     await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser),
     client.config
@@ -575,7 +597,7 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackCli
     body,
     client,
     directAllowed,
-    fallbackClient,
+    fallbackPool,
     thinking
   });
   logRequest(req, "anthropic transport selected", {
@@ -591,7 +613,7 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackCli
   });
 
   if (transportDecision.useExternalFallback) {
-    await tryExternalFallbackAnthropic(body, req, res, fallbackClient, binding, directRequest, {
+    await tryExternalFallbackAnthropic(body, req, res, fallbackPool, binding, directRequest, {
       cacheKey,
       responseCache
     }, createBridgeError(429, "direct-llm unavailable for thinking; using external fallback", "rate_limit_error"), "direct-unavailable");
@@ -618,7 +640,7 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackCli
       });
 
       if (!shouldFallback) {
-        if (await tryExternalFallbackAnthropic(body, req, res, fallbackClient, binding, directRequest, {
+        if (await tryExternalFallbackAnthropic(body, req, res, fallbackPool, binding, directRequest, {
           cacheKey,
           responseCache
         }, error, "direct-llm")) {
@@ -676,7 +698,7 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackCli
       }
     });
   } catch (error) {
-    if (await tryExternalFallbackAnthropic(body, req, res, fallbackClient, binding, directRequest, {
+    if (await tryExternalFallbackAnthropic(body, req, res, fallbackPool, binding, directRequest, {
       cacheKey,
       responseCache
     }, error, "local-ws")) {
@@ -699,7 +721,7 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackCli
   if (stream) {
     if (errorCode) {
       const logicalError = createBridgeError(Number(errorCode), errorMessage, classifyErrorType(Number(errorCode)));
-      if (await tryExternalFallbackAnthropic(body, req, res, fallbackClient, binding, directRequest, {
+      if (await tryExternalFallbackAnthropic(body, req, res, fallbackPool, binding, directRequest, {
         cacheKey,
         responseCache
       }, logicalError, "local-ws-logical")) {
@@ -735,7 +757,7 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackCli
 
   if (errorCode) {
     const logicalError = createBridgeError(Number(errorCode), errorMessage, classifyErrorType(Number(errorCode)));
-    if (await tryExternalFallbackAnthropic(body, req, res, fallbackClient, binding, directRequest, {
+    if (await tryExternalFallbackAnthropic(body, req, res, fallbackPool, binding, directRequest, {
       cacheKey,
       responseCache
     }, logicalError, "local-ws-logical")) {

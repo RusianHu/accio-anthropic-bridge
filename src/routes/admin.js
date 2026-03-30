@@ -21,6 +21,7 @@ const {
   writeSnapshotAuthPayload
 } = require("../auth-state");
 const { writeAccountToFile, findStoredAccountAuthPayload } = require("../accounts-file");
+const { ExternalFallbackClient, normalizeFallbackTarget, normalizeFallbackTargets } = require("../external-fallback");
 const { maskToken } = require("../redaction");
 const log = require("../logger");
 
@@ -75,45 +76,37 @@ function upsertEnvValues(filePath, values) {
 }
 
 function getFallbackSettings(config) {
+  const targets = normalizeFallbackTargets(config.fallbackTargets || []);
   return {
-    baseUrl: String(config.fallbackOpenAiBaseUrl || ""),
-    apiKey: String(config.fallbackOpenAiApiKey || ""),
-    model: String(config.fallbackOpenAiModel || ""),
-    protocol: String(config.fallbackOpenAiProtocol || "openai").toLowerCase() === "anthropic" ? "anthropic" : "openai",
-    anthropicVersion: String(config.fallbackAnthropicVersion || "2023-06-01"),
-    timeoutMs: Number(config.fallbackOpenAiTimeoutMs || 60000)
+    targets
   };
 }
 
-function applyFallbackSettings(config, fallbackClient, settings) {
-  const normalized = {
-    baseUrl: String(settings.baseUrl || "").trim(),
-    apiKey: String(settings.apiKey || "").trim(),
-    model: String(settings.model || "").trim(),
-    protocol: String(settings.protocol || "openai").trim().toLowerCase() === "anthropic" ? "anthropic" : "openai",
-    anthropicVersion: String(settings.anthropicVersion || "2023-06-01").trim() || "2023-06-01",
-    timeoutMs: Number(settings.timeoutMs || 60000) || 60000
-  };
+function applyFallbackSettings(config, fallbackPool, settings) {
+  const targets = normalizeFallbackTargets(Array.isArray(settings.targets) ? settings.targets : []);
+  const primary = targets[0] || normalizeFallbackTarget({}, 0);
 
-  config.fallbackOpenAiBaseUrl = normalized.baseUrl;
-  config.fallbackOpenAiApiKey = normalized.apiKey;
-  config.fallbackOpenAiModel = normalized.model;
-  config.fallbackOpenAiProtocol = normalized.protocol;
-  config.fallbackAnthropicVersion = normalized.anthropicVersion;
-  config.fallbackOpenAiTimeoutMs = normalized.timeoutMs;
+  config.fallbackTargets = targets;
+  config.fallbackOpenAiBaseUrl = primary.baseUrl;
+  config.fallbackOpenAiApiKey = primary.apiKey;
+  config.fallbackOpenAiModel = primary.model;
+  config.fallbackOpenAiProtocol = primary.protocol;
+  config.fallbackAnthropicVersion = primary.anthropicVersion;
+  config.fallbackOpenAiTimeoutMs = primary.timeoutMs;
 
-  process.env.ACCIO_FALLBACK_OPENAI_BASE_URL = normalized.baseUrl;
-  process.env.ACCIO_FALLBACK_OPENAI_API_KEY = normalized.apiKey;
-  process.env.ACCIO_FALLBACK_OPENAI_MODEL = normalized.model;
-  process.env.ACCIO_FALLBACK_PROTOCOL = normalized.protocol;
-  process.env.ACCIO_FALLBACK_ANTHROPIC_VERSION = normalized.anthropicVersion;
-  process.env.ACCIO_FALLBACK_OPENAI_TIMEOUT_MS = String(normalized.timeoutMs);
+  process.env.ACCIO_FALLBACKS_JSON = JSON.stringify(targets);
+  process.env.ACCIO_FALLBACK_OPENAI_BASE_URL = primary.baseUrl;
+  process.env.ACCIO_FALLBACK_OPENAI_API_KEY = primary.apiKey;
+  process.env.ACCIO_FALLBACK_OPENAI_MODEL = primary.model;
+  process.env.ACCIO_FALLBACK_PROTOCOL = primary.protocol;
+  process.env.ACCIO_FALLBACK_ANTHROPIC_VERSION = primary.anthropicVersion;
+  process.env.ACCIO_FALLBACK_OPENAI_TIMEOUT_MS = String(primary.timeoutMs || 60000);
 
-  if (fallbackClient && typeof fallbackClient.updateConfig === "function") {
-    fallbackClient.updateConfig(normalized);
+  if (fallbackPool && typeof fallbackPool.updateConfig === "function") {
+    fallbackPool.updateConfig({ targets });
   }
 
-  return normalized;
+  return { targets };
 }
 
 function escapeHtml(value) {
@@ -1141,7 +1134,7 @@ async function buildAdminState(config, authProvider, recentActivityStore) {
       envPath: config.envPath || path.join(process.cwd(), ".env")
     },
     settings: {
-      fallbackOpenAi: getFallbackSettings(config)
+      fallbacks: getFallbackSettings(config)
     },
     gateway,
     storage,
@@ -1755,10 +1748,69 @@ button { font: inherit; cursor: pointer; }
   gap: 16px;
   max-width: 920px;
 }
+.settingsToolbar {
+  display: flex;
+  justify-content: flex-start;
+}
 .settingsGrid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+}
+.fallbackTargets {
+  display: grid;
+  gap: 14px;
+}
+.fallbackCard {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,0.76);
+  box-shadow: var(--shadow-sm);
+}
+.fallbackCardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.fallbackCardTitle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.fallbackCardTitle strong {
+  font-size: 15px;
+  color: var(--ink);
+}
+.fallbackCardMeta {
+  font-size: 12px;
+  color: var(--muted);
+}
+.fallbackCardActions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.toggleRow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(24,22,20,0.04);
+  color: var(--ink-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+.toggleRow input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
 }
 .field {
   display: grid;
@@ -1960,53 +2012,27 @@ button { font: inherit; cursor: pointer; }
     <section class="panel settingsPanel">
       <div class="sectionHeader">
         <div>
-          <h2>\u5916\u90E8\u4E0A\u6E38\u5140\u5E95</h2>
-          <div class="panelSub">\u5F53\u8D26\u53F7\u6C60\u548C\u672C\u5730\u94FE\u8DEF\u90FD\u4E0D\u53EF\u7528\u65F6\uFF0C\u53EF\u4EE5\u8F6C\u5411 OpenAI \u517C\u5BB9\u4E0A\u6E38\u6216 Anthropic Messages \u4E0A\u6E38\u3002Anthropic \u534F\u8BAE\u66F4\u9002\u5408 Claude Code \u8FD9\u7C7B\u539F\u751F\u5BA2\u6237\u7AEF\u3002</div>
+          <h2>\u5916\u90E8\u4E0A\u6E38\u6E20\u9053</h2>
+          <div class="panelSub">\u5F53\u53F7\u6C60\u548C\u672C\u5730\u94FE\u8DEF\u4E0D\u53EF\u7528\u65F6\uFF0Cbridge \u4F1A\u6309\u5217\u8868\u987A\u5E8F\u4F9D\u6B21\u5C1D\u8BD5\u8FD9\u4E9B\u5916\u90E8\u4E0A\u6E38\u6E20\u9053\u3002\u4F60\u53EF\u4EE5\u6DF7\u7528 OpenAI compatible \u548C Anthropic Messages \u3002</div>
         </div>
       </div>
-      <div class="settingsGrid">
-        <div class="field">
-          <label for="fallback-protocol">\u534F\u8BAE</label>
-          <select id="fallback-protocol">
-            <option value="openai">OpenAI compatible</option>
-            <option value="anthropic">Anthropic Messages</option>
-          </select>
-        </div>
-        <div class="field wide">
-          <label for="fallback-base-url">Base URL</label>
-          <input id="fallback-base-url" type="text" placeholder="https://your-upstream-host/v1" autocomplete="off" />
-          <div class="fieldHint">OpenAI \u534F\u8BAE\u901A\u5E38\u586B\u5230 /v1\uFF1BAnthropic \u534F\u8BAE\u586B\u5230\u63D0\u4F9B /messages \u7684\u6839\u524D\u7F00\uFF0C\u4F8B\u5982 https://api.anthropic.com/v1\u3002</div>
-        </div>
-        <div class="field wide">
-          <label for="fallback-api-key">API Key</label>
-          <div class="inputWrap">
-            <input id="fallback-api-key" type="password" placeholder="sk-..." autocomplete="off" autocapitalize="off" spellcheck="false" />
-            <button class="inputToggle" id="fallback-api-key-toggle" type="button" aria-label="显示 API Key" title="显示或隐藏 API Key">👁</button>
-          </div>
-          <div class="fieldHint">\u4FDD\u5B58\u540E\u4F1A\u5199\u5165 bridge \u6839\u76EE\u5F55\u7684 .env\uFF0C\u5E76\u7ACB\u5373\u66F4\u65B0\u5F53\u524D\u8FDB\u7A0B\u5185\u7684\u5140\u5E95\u5BA2\u6237\u7AEF\u3002</div>
-        </div>
-        <div class="field">
-          <label for="fallback-model">Model</label>
-          <input id="fallback-model" type="text" placeholder="gpt-4.1-mini" autocomplete="off" />
-        </div>
-        <div class="field">
-          <label for="fallback-anthropic-version">Anthropic Version</label>
-          <input id="fallback-anthropic-version" type="text" placeholder="2023-06-01" autocomplete="off" />
-        </div>
-        <div class="field">
-          <label for="fallback-timeout-ms">Timeout (ms)</label>
-          <input id="fallback-timeout-ms" type="number" min="1000" step="1000" placeholder="60000" />
-        </div>
+      <div class="settingsToolbar">
+        <button class="btn" id="add-fallback-target-btn">\uFF0B \u65B0\u589E\u6E20\u9053</button>
       </div>
+      <div class="fallbackTargets" id="fallback-targets"></div>
+      <div class="empty" id="fallback-empty" style="display:none">\u6682\u65E0\u5916\u90E8\u4E0A\u6E38\u6E20\u9053\u3002\u70B9\u51FB\u201C\u65B0\u589E\u6E20\u9053\u201D\u5F00\u59CB\u914D\u7F6E\u3002</div>
+      <div class="fieldHint">\u4FDD\u5B58\u540E\u4F1A\u5199\u5165 bridge \u6839\u76EE\u5F55\u7684 .env\uFF0C\u5E76\u7ACB\u5373\u66F4\u65B0\u5F53\u524D\u8FDB\u7A0B\u5185\u7684\u5916\u90E8\u4E0A\u6E38\u5217\u8868\u3002</div>
+      <div class="fieldHint">OpenAI \u534F\u8BAE\u901A\u5E38\u586B\u5230 <code>/v1</code>\uFF1BAnthropic \u534F\u8BAE\u586B\u5230\u63D0\u4F9B <code>/messages</code> \u7684\u6839\u524D\u7F00\u3002</div>
+      <div class="fieldHint">\u5217\u8868\u987A\u5E8F\u5C31\u662F\u5140\u5E95\u5C1D\u8BD5\u987A\u5E8F\uFF0C\u53EF\u4EE5\u7528\u201C\u4E0A\u79FB/\u4E0B\u79FB\u201D\u8C03\u6574\u4F18\u5148\u7EA7\u3002</div>
+      <div class="fieldHint">Anthropic \u6E20\u9053\u66F4\u9002\u5408 Claude Code \u7B49\u539F\u751F Anthropic \u5BA2\u6237\u7AEF\u8BF7\u6C42\u900F\u4F20\u3002</div>
       <div class="settingsActions">
-        <button class="btn primary" id="save-fallback-config-btn">\u4FDD\u5B58\u5140\u5E95\u914D\u7F6E</button>
-        <button class="btn" id="test-fallback-config-btn">\u6D4B\u8BD5\u8FDE\u63A5</button>
+        <button class="btn primary" id="save-fallback-config-btn">\u4FDD\u5B58\u6E20\u9053\u914D\u7F6E</button>
         <button class="btn" id="reload-fallback-config-btn">\u91CD\u65B0\u8F7D\u5165</button>
       </div>
       <div id="config-message" class="message info"></div>
       <div class="settingsMeta">
         <div class="miniStat">
-          <div class="miniStatLabel">\u5F53\u524D\u72B6\u6001</div>
+          <div class="miniStatLabel">\u6E20\u9053\u6982\u89C8</div>
           <div class="miniStatValue" id="fallback-status">\u672A\u914D\u7F6E</div>
         </div>
         <div class="miniStat">
@@ -2035,16 +2061,11 @@ const els = {
   logoutBtn: document.getElementById('logout-btn'),
   accountLoginBtn: document.getElementById('account-login-btn'),
   snapshotBtn: document.getElementById('capture-current-btn'),
+  addFallbackTargetBtn: document.getElementById('add-fallback-target-btn'),
   saveFallbackConfigBtn: document.getElementById('save-fallback-config-btn'),
-  testFallbackConfigBtn: document.getElementById('test-fallback-config-btn'),
   reloadFallbackConfigBtn: document.getElementById('reload-fallback-config-btn'),
-  fallbackProtocol: document.getElementById('fallback-protocol'),
-  fallbackBaseUrl: document.getElementById('fallback-base-url'),
-  fallbackApiKey: document.getElementById('fallback-api-key'),
-  fallbackApiKeyToggle: document.getElementById('fallback-api-key-toggle'),
-  fallbackModel: document.getElementById('fallback-model'),
-  fallbackAnthropicVersion: document.getElementById('fallback-anthropic-version'),
-  fallbackTimeoutMs: document.getElementById('fallback-timeout-ms'),
+  fallbackTargets: document.getElementById('fallback-targets'),
+  fallbackEmpty: document.getElementById('fallback-empty'),
   fallbackStatus: document.getElementById('fallback-status'),
   fallbackEnvPath: document.getElementById('fallback-env-path')
 };
@@ -2057,6 +2078,7 @@ let configMessageTimer = null;
 let currentTab = 'accounts';
 let refreshInFlight = null;
 let stateStream = null;
+let fallbackDraft = [];
 const MSG_ICONS = { info: 'ℹ️', ok: '✅', warn: '⚠️', error: '❌' };
 function setScopedMessage(target, type, text, scope) {
   if (!target) {
@@ -2317,19 +2339,94 @@ function escapeInline(value) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
-function renderSettings(data) {
-  const settings = data && data.settings && data.settings.fallbackOpenAi ? data.settings.fallbackOpenAi : {};
-  const configured = Boolean(settings.baseUrl && settings.apiKey && settings.model);
-  const protocol = settings.protocol === 'anthropic' ? 'anthropic' : 'openai';
+function createFallbackDraftTarget(index) {
+  return {
+    id: 'draft_' + Date.now().toString(36) + '_' + index,
+    name: '渠道 ' + (index + 1),
+    enabled: true,
+    protocol: 'openai',
+    baseUrl: '',
+    apiKey: '',
+    model: '',
+    anthropicVersion: '2023-06-01',
+    timeoutMs: 60000
+  };
+}
+function normalizeFallbackDraftTarget(target, index) {
+  return {
+    id: String(target && target.id ? target.id : ('draft_' + index)),
+    name: String(target && target.name ? target.name : ('渠道 ' + (index + 1))).trim() || ('渠道 ' + (index + 1)),
+    enabled: target && target.enabled !== false,
+    protocol: target && target.protocol === 'anthropic' ? 'anthropic' : 'openai',
+    baseUrl: String(target && target.baseUrl ? target.baseUrl : ''),
+    apiKey: String(target && target.apiKey ? target.apiKey : ''),
+    model: String(target && target.model ? target.model : ''),
+    anthropicVersion: String(target && target.anthropicVersion ? target.anthropicVersion : '2023-06-01'),
+    timeoutMs: Number(target && target.timeoutMs ? target.timeoutMs : 60000) || 60000
+  };
+}
+function collectFallbackDraft() {
+  if (!els.fallbackTargets) {
+    return [];
+  }
 
-  if (els.fallbackProtocol) els.fallbackProtocol.value = protocol;
-  if (els.fallbackBaseUrl) els.fallbackBaseUrl.value = settings.baseUrl || '';
-  if (els.fallbackApiKey) els.fallbackApiKey.value = settings.apiKey || '';
-  if (els.fallbackModel) els.fallbackModel.value = settings.model || '';
-  if (els.fallbackAnthropicVersion) els.fallbackAnthropicVersion.value = settings.anthropicVersion || '2023-06-01';
-  if (els.fallbackTimeoutMs) els.fallbackTimeoutMs.value = settings.timeoutMs ? String(settings.timeoutMs) : '60000';
-  if (els.fallbackStatus) els.fallbackStatus.textContent = configured
-    ? ('已配置 · ' + (protocol === 'anthropic' ? 'Anthropic' : 'OpenAI') + ' · ' + (settings.model || 'external-upstream'))
+  return Array.from(els.fallbackTargets.querySelectorAll('[data-fallback-item]')).map((item, index) => normalizeFallbackDraftTarget({
+    id: item.getAttribute('data-fallback-id') || ('draft_' + index),
+    name: item.querySelector('[data-field=\"name\"]') ? item.querySelector('[data-field=\"name\"]').value.trim() : '',
+    enabled: item.querySelector('[data-field=\"enabled\"]') ? item.querySelector('[data-field=\"enabled\"]').checked : true,
+    protocol: item.querySelector('[data-field=\"protocol\"]') ? item.querySelector('[data-field=\"protocol\"]').value : 'openai',
+    baseUrl: item.querySelector('[data-field=\"baseUrl\"]') ? item.querySelector('[data-field=\"baseUrl\"]').value.trim() : '',
+    apiKey: item.querySelector('[data-field=\"apiKey\"]') ? item.querySelector('[data-field=\"apiKey\"]').value.trim() : '',
+    model: item.querySelector('[data-field=\"model\"]') ? item.querySelector('[data-field=\"model\"]').value.trim() : '',
+    anthropicVersion: item.querySelector('[data-field=\"anthropicVersion\"]') ? item.querySelector('[data-field=\"anthropicVersion\"]').value.trim() : '2023-06-01',
+    timeoutMs: item.querySelector('[data-field=\"timeoutMs\"]') ? Number(item.querySelector('[data-field=\"timeoutMs\"]').value || 60000) : 60000
+  }, index));
+}
+function renderFallbackTargets() {
+  if (!els.fallbackTargets || !els.fallbackEmpty) {
+    return;
+  }
+
+  const targets = Array.isArray(fallbackDraft) ? fallbackDraft : [];
+  els.fallbackEmpty.style.display = targets.length === 0 ? '' : 'none';
+  els.fallbackTargets.innerHTML = targets.map((target, index) => {
+    const protocolLabel = target.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI';
+    return '<section class="fallbackCard" data-fallback-item data-fallback-id="' + escapeInline(target.id) + '">'
+      + '<div class="fallbackCardHeader">'
+      + '<div class="fallbackCardTitle">'
+      + '<strong>' + escapeInline(target.name || ('渠道 ' + (index + 1))) + '</strong>'
+      + '<span class="pill ' + (target.enabled ? 'current' : 'warn') + '">' + (target.enabled ? '启用' : '停用') + '</span>'
+      + '<span class="fallbackCardMeta">' + protocolLabel + ' · 优先级 ' + (index + 1) + '</span>'
+      + '</div>'
+      + '<div class="fallbackCardActions">'
+      + '<button class="btn" type="button" data-move-up-fallback="' + escapeInline(target.id) + '"' + (index === 0 ? ' disabled' : '') + '>上移</button>'
+      + '<button class="btn" type="button" data-move-down-fallback="' + escapeInline(target.id) + '"' + (index === targets.length - 1 ? ' disabled' : '') + '>下移</button>'
+      + '<button class="btn" type="button" data-test-fallback="' + escapeInline(target.id) + '">测试</button>'
+      + '<button class="btn warn" type="button" data-delete-fallback="' + escapeInline(target.id) + '">删除</button>'
+      + '</div>'
+      + '</div>'
+      + '<div class="settingsGrid">'
+      + '<div class="field"><label>名称</label><input data-field="name" type="text" value="' + escapeInline(target.name) + '" placeholder="渠道 1" autocomplete="off" /></div>'
+      + '<div class="field"><label>协议</label><select data-field="protocol"><option value="openai"' + (target.protocol === 'openai' ? ' selected' : '') + '>OpenAI compatible</option><option value="anthropic"' + (target.protocol === 'anthropic' ? ' selected' : '') + '>Anthropic Messages</option></select></div>'
+      + '<div class="field wide"><label>Base URL</label><input data-field="baseUrl" type="text" value="' + escapeInline(target.baseUrl) + '" placeholder="https://your-upstream-host/v1" autocomplete="off" /></div>'
+      + '<div class="field wide"><label>API Key</label><div class="inputWrap"><input data-field="apiKey" type="password" value="' + escapeInline(target.apiKey) + '" placeholder="sk-..." autocomplete="off" autocapitalize="off" spellcheck="false" /><button class="inputToggle" type="button" data-toggle-secret="' + escapeInline(target.id) + '" aria-label="显示 API Key" title="显示或隐藏 API Key">👁</button></div></div>'
+      + '<div class="field"><label>Model</label><input data-field="model" type="text" value="' + escapeInline(target.model) + '" placeholder="gpt-4.1-mini" autocomplete="off" /></div>'
+      + '<div class="field"><label>Anthropic Version</label><input data-field="anthropicVersion" type="text" value="' + escapeInline(target.anthropicVersion || '2023-06-01') + '" placeholder="2023-06-01" autocomplete="off" /></div>'
+      + '<div class="field"><label>Timeout (ms)</label><input data-field="timeoutMs" type="number" min="1000" step="1000" value="' + escapeInline(String(target.timeoutMs || 60000)) + '" /></div>'
+      + '<div class="field"><label>状态</label><label class="toggleRow"><input data-field="enabled" type="checkbox"' + (target.enabled ? ' checked' : '') + ' /><span>参与兜底顺序</span></label></div>'
+      + '</div>'
+      + '</section>';
+  }).join('');
+}
+function renderSettings(data) {
+  const targets = data && data.settings && data.settings.fallbacks && Array.isArray(data.settings.fallbacks.targets)
+    ? data.settings.fallbacks.targets
+    : [];
+  fallbackDraft = targets.map((target, index) => normalizeFallbackDraftTarget(target, index));
+  renderFallbackTargets();
+  const enabledTargets = fallbackDraft.filter((target) => target.enabled !== false && target.baseUrl && target.apiKey && target.model);
+  if (els.fallbackStatus) els.fallbackStatus.textContent = enabledTargets.length > 0
+    ? ('已配置 ' + enabledTargets.length + ' 条 · 首选 ' + (enabledTargets[0].name || enabledTargets[0].model || 'external-upstream'))
     : '未配置';
   if (els.fallbackEnvPath) els.fallbackEnvPath.textContent = data && data.bridge && data.bridge.envPath ? data.bridge.envPath : '.env';
 }
@@ -2672,47 +2769,28 @@ document.addEventListener('click', async (event) => {
     }
   }, 3000);
 });
+if (els.addFallbackTargetBtn) {
+  els.addFallbackTargetBtn.addEventListener('click', () => {
+    fallbackDraft = collectFallbackDraft();
+    fallbackDraft.push(createFallbackDraftTarget(fallbackDraft.length));
+    renderFallbackTargets();
+  });
+}
+
 if (els.saveFallbackConfigBtn) {
   els.saveFallbackConfigBtn.addEventListener('click', () => withAction(els.saveFallbackConfigBtn, async () => {
     clearConfigMessage();
+    fallbackDraft = collectFallbackDraft();
     const payload = await api('/admin/api/config', {
       method: 'POST',
       body: {
-        fallbackOpenAi: {
-          protocol: els.fallbackProtocol ? els.fallbackProtocol.value : 'openai',
-          baseUrl: els.fallbackBaseUrl ? els.fallbackBaseUrl.value.trim() : '',
-          apiKey: els.fallbackApiKey ? els.fallbackApiKey.value.trim() : '',
-          model: els.fallbackModel ? els.fallbackModel.value.trim() : '',
-          anthropicVersion: els.fallbackAnthropicVersion ? els.fallbackAnthropicVersion.value.trim() : '2023-06-01',
-          timeoutMs: els.fallbackTimeoutMs ? Number(els.fallbackTimeoutMs.value || 60000) : 60000
+        fallbacks: {
+          targets: fallbackDraft
         }
       }
     });
     renderSettings({ settings: payload.settings, bridge: payload.bridge });
-    setConfigMessage('ok', '外部上游兜底配置已保存并立即生效。');
-  }));
-}
-
-if (els.testFallbackConfigBtn) {
-  els.testFallbackConfigBtn.addEventListener('click', () => withAction(els.testFallbackConfigBtn, async () => {
-    clearConfigMessage();
-    const payload = await api('/admin/api/config/test', {
-      method: 'POST',
-      body: {
-        fallbackOpenAi: {
-          protocol: els.fallbackProtocol ? els.fallbackProtocol.value : 'openai',
-          baseUrl: els.fallbackBaseUrl ? els.fallbackBaseUrl.value.trim() : '',
-          apiKey: els.fallbackApiKey ? els.fallbackApiKey.value.trim() : '',
-          model: els.fallbackModel ? els.fallbackModel.value.trim() : '',
-          anthropicVersion: els.fallbackAnthropicVersion ? els.fallbackAnthropicVersion.value.trim() : '2023-06-01',
-          timeoutMs: els.fallbackTimeoutMs ? Number(els.fallbackTimeoutMs.value || 60000) : 60000
-        }
-      }
-    });
-
-    const result = payload && payload.result ? payload.result : {};
-    const preview = result.preview ? ('，返回预览：' + String(result.preview).slice(0, 80)) : '';
-    setConfigMessage('ok', '连接成功：' + (result.protocol || 'unknown') + ' · ' + (result.model || 'unknown') + preview);
+    setConfigMessage('ok', '多渠道上游配置已保存并立即生效。');
   }));
 }
 
@@ -2721,17 +2799,79 @@ if (els.reloadFallbackConfigBtn) {
     clearConfigMessage();
     const payload = await api('/admin/api/config');
     renderSettings({ settings: payload.settings, bridge: payload.bridge });
-    setConfigMessage('info', '已重新载入当前兜底配置。');
+    setConfigMessage('info', '已重新载入当前多渠道配置。');
   }));
 }
 
-if (els.fallbackApiKeyToggle && els.fallbackApiKey) {
-  els.fallbackApiKeyToggle.addEventListener('click', () => {
-    const nextVisible = els.fallbackApiKey.type === 'password';
-    els.fallbackApiKey.type = nextVisible ? 'text' : 'password';
-    els.fallbackApiKeyToggle.textContent = nextVisible ? '🙈' : '👁';
-    els.fallbackApiKeyToggle.setAttribute('aria-label', nextVisible ? '隐藏 API Key' : '显示 API Key');
-    els.fallbackApiKeyToggle.setAttribute('title', nextVisible ? '隐藏 API Key' : '显示或隐藏 API Key');
+if (els.fallbackTargets) {
+  els.fallbackTargets.addEventListener('click', async (event) => {
+    const toggle = event.target.closest('[data-toggle-secret]');
+    if (toggle) {
+      const input = toggle.closest('.inputWrap') ? toggle.closest('.inputWrap').querySelector('input[data-field="apiKey"]') : null;
+      if (input) {
+        const nextVisible = input.type === 'password';
+        input.type = nextVisible ? 'text' : 'password';
+        toggle.textContent = nextVisible ? '🙈' : '👁';
+        toggle.setAttribute('aria-label', nextVisible ? '隐藏 API Key' : '显示 API Key');
+        toggle.setAttribute('title', nextVisible ? '隐藏 API Key' : '显示或隐藏 API Key');
+      }
+      return;
+    }
+
+    const remove = event.target.closest('[data-delete-fallback]');
+    if (remove) {
+      fallbackDraft = collectFallbackDraft().filter((target) => target.id !== remove.getAttribute('data-delete-fallback'));
+      renderFallbackTargets();
+      return;
+    }
+
+    const moveUp = event.target.closest('[data-move-up-fallback]');
+    if (moveUp) {
+      const id = moveUp.getAttribute('data-move-up-fallback');
+      fallbackDraft = collectFallbackDraft();
+      const index = fallbackDraft.findIndex((target) => target.id === id);
+      if (index > 0) {
+        const temp = fallbackDraft[index - 1];
+        fallbackDraft[index - 1] = fallbackDraft[index];
+        fallbackDraft[index] = temp;
+        renderFallbackTargets();
+      }
+      return;
+    }
+
+    const moveDown = event.target.closest('[data-move-down-fallback]');
+    if (moveDown) {
+      const id = moveDown.getAttribute('data-move-down-fallback');
+      fallbackDraft = collectFallbackDraft();
+      const index = fallbackDraft.findIndex((target) => target.id === id);
+      if (index >= 0 && index < fallbackDraft.length - 1) {
+        const temp = fallbackDraft[index + 1];
+        fallbackDraft[index + 1] = fallbackDraft[index];
+        fallbackDraft[index] = temp;
+        renderFallbackTargets();
+      }
+      return;
+    }
+
+    const testBtn = event.target.closest('[data-test-fallback]');
+    if (testBtn) {
+      const id = testBtn.getAttribute('data-test-fallback');
+      fallbackDraft = collectFallbackDraft();
+      const target = fallbackDraft.find((item) => item.id === id);
+      if (!target) {
+        return;
+      }
+      await withAction(testBtn, async () => {
+        clearConfigMessage();
+        const payload = await api('/admin/api/config/test', {
+          method: 'POST',
+          body: { target }
+        });
+        const result = payload && payload.result ? payload.result : {};
+        const preview = result.preview ? ('，返回预览：' + String(result.preview).slice(0, 80)) : '';
+        setConfigMessage('ok', '连接成功：' + (target.name || '渠道') + ' · ' + (result.protocol || 'unknown') + ' · ' + (result.model || 'unknown') + preview);
+      });
+    }
   });
 }
 
@@ -2828,7 +2968,7 @@ async function handleAdminConfigGet(req, res, config) {
   writeJson(res, 200, {
     ok: true,
     settings: {
-      fallbackOpenAi: getFallbackSettings(config)
+      fallbacks: getFallbackSettings(config)
     },
     bridge: {
       envPath: config.envPath || path.join(process.cwd(), ".env")
@@ -2836,43 +2976,40 @@ async function handleAdminConfigGet(req, res, config) {
   });
 }
 
-async function handleAdminConfigSave(req, res, config, fallbackClient) {
+async function handleAdminConfigSave(req, res, config, fallbackPool) {
   const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
-  const fallback = body && body.fallbackOpenAi && typeof body.fallbackOpenAi === "object"
-    ? body.fallbackOpenAi
+  const fallbacks = body && body.fallbacks && typeof body.fallbacks === "object"
+    ? body.fallbacks
     : {};
 
-  const nextSettings = applyFallbackSettings(config, fallbackClient, {
-    protocol: fallback.protocol,
-    baseUrl: fallback.baseUrl,
-    apiKey: fallback.apiKey,
-    model: fallback.model,
-    anthropicVersion: fallback.anthropicVersion,
-    timeoutMs: fallback.timeoutMs
+  const nextSettings = applyFallbackSettings(config, fallbackPool, {
+    targets: Array.isArray(fallbacks.targets) ? fallbacks.targets : []
   });
+  const primary = nextSettings.targets[0] || null;
 
   const envPath = config.envPath || path.join(process.cwd(), ".env");
   upsertEnvValues(envPath, {
-    ACCIO_FALLBACK_OPENAI_BASE_URL: nextSettings.baseUrl,
-    ACCIO_FALLBACK_OPENAI_API_KEY: nextSettings.apiKey,
-    ACCIO_FALLBACK_OPENAI_MODEL: nextSettings.model,
-    ACCIO_FALLBACK_PROTOCOL: nextSettings.protocol,
-    ACCIO_FALLBACK_ANTHROPIC_VERSION: nextSettings.anthropicVersion,
-    ACCIO_FALLBACK_OPENAI_TIMEOUT_MS: String(nextSettings.timeoutMs)
+    ACCIO_FALLBACKS_JSON: JSON.stringify(nextSettings.targets),
+    ACCIO_FALLBACK_OPENAI_BASE_URL: primary ? primary.baseUrl : "",
+    ACCIO_FALLBACK_OPENAI_API_KEY: primary ? primary.apiKey : "",
+    ACCIO_FALLBACK_OPENAI_MODEL: primary ? primary.model : "",
+    ACCIO_FALLBACK_PROTOCOL: primary ? primary.protocol : "openai",
+    ACCIO_FALLBACK_ANTHROPIC_VERSION: primary ? primary.anthropicVersion : "2023-06-01",
+    ACCIO_FALLBACK_OPENAI_TIMEOUT_MS: String(primary ? primary.timeoutMs : 60000)
   });
 
   log.info("admin fallback settings updated", {
     envPath,
-    fallbackConfigured: Boolean(nextSettings.baseUrl && nextSettings.apiKey && nextSettings.model),
-    fallbackProtocol: nextSettings.protocol,
-    fallbackModel: nextSettings.model || null
+    fallbackCount: nextSettings.targets.length,
+    fallbackProtocol: primary ? primary.protocol : null,
+    fallbackModel: primary ? (primary.model || null) : null
   });
 
   writeJson(res, 200, {
     ok: true,
     saved: true,
     settings: {
-      fallbackOpenAi: nextSettings
+      fallbacks: nextSettings
     },
     bridge: {
       envPath
@@ -2882,17 +3019,12 @@ async function handleAdminConfigSave(req, res, config, fallbackClient) {
 
 async function handleAdminConfigTest(req, res) {
   const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
-  const fallback = body && body.fallbackOpenAi && typeof body.fallbackOpenAi === "object"
-    ? body.fallbackOpenAi
-    : {};
+  const target = body && body.target && typeof body.target === "object"
+    ? normalizeFallbackTarget(body.target, 0)
+    : normalizeFallbackTarget({}, 0);
 
-  const probeClient = new (require("../external-fallback").ExternalFallbackClient)({
-    protocol: fallback.protocol,
-    baseUrl: fallback.baseUrl,
-    apiKey: fallback.apiKey,
-    model: fallback.model,
-    anthropicVersion: fallback.anthropicVersion,
-    timeoutMs: fallback.timeoutMs,
+  const probeClient = new ExternalFallbackClient({
+    ...target,
     fetchImpl: fetch
   });
 
@@ -2910,6 +3042,7 @@ async function handleAdminConfigTest(req, res) {
   try {
     const result = await probeClient.probe();
     log.info("admin fallback settings tested", {
+      fallbackName: target.name,
       fallbackProtocol: result.protocol,
       fallbackTransport: result.transport,
       fallbackModel: result.model || null

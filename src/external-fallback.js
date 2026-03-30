@@ -8,6 +8,34 @@ const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 const { classifyErrorType } = require("./errors");
 const { delay } = require("./utils");
 
+function createFallbackId() {
+  return "fb_" + Math.random().toString(36).slice(2, 10);
+}
+
+function normalizeFallbackTarget(target = {}, index = 0) {
+  return {
+    id: String(target.id || createFallbackId()),
+    name: String(target.name || ("渠道 " + (index + 1))).trim() || ("渠道 " + (index + 1)),
+    enabled: target.enabled !== false,
+    baseUrl: String(target.baseUrl || "").trim().replace(/\/$/, ""),
+    apiKey: String(target.apiKey || "").trim(),
+    model: String(target.model || "").trim(),
+    protocol: String(target.protocol || "openai").toLowerCase() === "anthropic" ? "anthropic" : "openai",
+    anthropicVersion: String(target.anthropicVersion || DEFAULT_ANTHROPIC_VERSION).trim() || DEFAULT_ANTHROPIC_VERSION,
+    timeoutMs: Number(target.timeoutMs || 60000) || 60000
+  };
+}
+
+function normalizeFallbackTargets(targets) {
+  if (!Array.isArray(targets)) {
+    return [];
+  }
+
+  return targets
+    .map((target, index) => normalizeFallbackTarget(target, index))
+    .filter((target) => target.enabled !== false);
+}
+
 function createTimeoutController(timeoutMs) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     return { signal: undefined, clear() {} };
@@ -304,6 +332,9 @@ class ExternalFallbackClient {
   }
 
   updateConfig(config = {}) {
+    this.id = String(config.id || this.id || createFallbackId());
+    this.name = String(config.name || this.name || "外部渠道");
+    this.enabled = config.enabled !== false;
     this.baseUrl = String(config.baseUrl || "").replace(/\/$/, "");
     this.apiKey = String(config.apiKey || "");
     this.model = String(config.model || "");
@@ -674,11 +705,54 @@ class ExternalFallbackClient {
   }
 }
 
+class ExternalFallbackPool {
+  constructor(config = {}) {
+    this.fetchImpl = config.fetchImpl || fetch;
+    this.updateConfig(config);
+  }
+
+  updateConfig(config = {}) {
+    const targets = normalizeFallbackTargets(config.targets || []);
+    this.targets = targets;
+    this.entries = targets.map((target) => ({
+      target,
+      client: new ExternalFallbackClient({
+        ...target,
+        fetchImpl: this.fetchImpl
+      })
+    }));
+    return this.targets;
+  }
+
+  isConfigured() {
+    return this.entries.some((entry) => entry.client.isConfigured());
+  }
+
+  getSettings() {
+    return this.targets.map((target) => ({ ...target }));
+  }
+
+  getEligibleAnthropic(body) {
+    return this.entries.filter((entry) => entry.client.isEligibleAnthropic(body));
+  }
+
+  getEligibleOpenAi(body) {
+    return this.entries.filter((entry) => entry.client.isEligibleOpenAi(body));
+  }
+
+  getConfiguredEntries() {
+    return this.entries.filter((entry) => entry.client.isConfigured());
+  }
+}
+
 module.exports = {
   DEFAULT_ANTHROPIC_VERSION,
   ExternalFallbackClient,
+  ExternalFallbackPool,
   anthropicToAnthropicPayload,
   anthropicToFallbackMessages,
+  normalizeFallbackTarget,
+  normalizeFallbackTargets,
   openAiToAnthropicPayload,
   openAiToFallbackMessages,
   shouldFallbackToExternalProvider

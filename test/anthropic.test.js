@@ -84,10 +84,12 @@ test("selectAnthropicTransport prefers external fallback over local-ws when thin
     },
     client: { config: { transportMode: "auto" } },
     directAllowed: false,
-    fallbackClient: {
-      protocol: "anthropic",
-      isEligibleAnthropic() {
-        return true;
+    fallbackPool: {
+      getEligibleAnthropic() {
+        return [{
+          target: { id: "a" },
+          client: { protocol: "anthropic" }
+        }];
       }
     },
     thinking: { type: "enabled" }
@@ -107,7 +109,7 @@ test("selectAnthropicTransport marks thinking unsupported when neither direct no
     },
     client: { config: { transportMode: "auto" } },
     directAllowed: false,
-    fallbackClient: null,
+    fallbackPool: null,
     thinking: { type: "enabled" }
   });
 

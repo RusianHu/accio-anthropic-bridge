@@ -3,12 +3,45 @@
 const path = require("node:path");
 
 const { discoverAccioAppPath, discoverAccioConfig } = require("./discovery");
+const { normalizeFallbackTarget } = require("./external-fallback");
 const { parseFlag } = require("./gateway-manager");
 
 function env(name, fallback) {
   return Object.prototype.hasOwnProperty.call(process.env, name)
     ? process.env[name]
     : fallback;
+}
+
+function parseFallbackTargetsFromEnv() {
+  const raw = String(env("ACCIO_FALLBACKS_JSON", "") || "").trim();
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.map((item, index) => normalizeFallbackTarget(item, index));
+      }
+    } catch {
+      // Ignore invalid JSON and fall back to legacy single-target env vars.
+    }
+  }
+
+  const legacy = normalizeFallbackTarget({
+    id: "legacy-primary",
+    name: "默认渠道",
+    baseUrl: env("ACCIO_FALLBACK_OPENAI_BASE_URL", ""),
+    apiKey: env("ACCIO_FALLBACK_OPENAI_API_KEY", ""),
+    model: env("ACCIO_FALLBACK_OPENAI_MODEL", ""),
+    protocol: env("ACCIO_FALLBACK_PROTOCOL", "openai"),
+    anthropicVersion: env("ACCIO_FALLBACK_ANTHROPIC_VERSION", "2023-06-01"),
+    timeoutMs: Number(env("ACCIO_FALLBACK_OPENAI_TIMEOUT_MS", "60000")),
+    enabled: true
+  }, 0);
+
+  if (!legacy.baseUrl && !legacy.apiKey && !legacy.model) {
+    return [];
+  }
+
+  return [legacy];
 }
 
 function createConfig() {
@@ -23,6 +56,8 @@ function createConfig() {
     sourceUserId: env("ACCIO_SOURCE_USER_ID", ""),
     workspacePath: env("ACCIO_WORKSPACE_PATH", "")
   });
+  const fallbackTargets = parseFallbackTargetsFromEnv();
+  const primaryFallback = fallbackTargets[0] || normalizeFallbackTarget({}, 0);
 
   return {
     envPath: path.join(process.cwd(), ".env"),
@@ -60,12 +95,13 @@ function createConfig() {
       "ACCIO_DIRECT_LLM_BASE_URL",
       "https://phoenix-gw.alibaba.com/api/adk/llm"
     ),
-    fallbackOpenAiBaseUrl: env("ACCIO_FALLBACK_OPENAI_BASE_URL", ""),
-    fallbackOpenAiApiKey: env("ACCIO_FALLBACK_OPENAI_API_KEY", ""),
-    fallbackOpenAiModel: env("ACCIO_FALLBACK_OPENAI_MODEL", ""),
-    fallbackOpenAiProtocol: env("ACCIO_FALLBACK_PROTOCOL", "openai"),
-    fallbackAnthropicVersion: env("ACCIO_FALLBACK_ANTHROPIC_VERSION", "2023-06-01"),
-    fallbackOpenAiTimeoutMs: Number(env("ACCIO_FALLBACK_OPENAI_TIMEOUT_MS", "60000")),
+    fallbackTargets,
+    fallbackOpenAiBaseUrl: primaryFallback.baseUrl,
+    fallbackOpenAiApiKey: primaryFallback.apiKey,
+    fallbackOpenAiModel: primaryFallback.model,
+    fallbackOpenAiProtocol: primaryFallback.protocol,
+    fallbackAnthropicVersion: primaryFallback.anthropicVersion,
+    fallbackOpenAiTimeoutMs: Number(primaryFallback.timeoutMs || 60000),
     clientIdPrefix: env("ACCIO_CLIENT_ID_PREFIX", "anthropic-bridge"),
     sessionStorePath: env(
       "ACCIO_SESSION_STORE_PATH",
