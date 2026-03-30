@@ -1619,12 +1619,19 @@ button { font: inherit; cursor: pointer; }
 .sectionHeader {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
+  margin-bottom: 4px;
+}
+.sectionHeader > div:first-child {
+  flex: 1;
+  min-width: 0;
 }
 .sectionHeader > .btn {
-  flex-shrink: 0;
+  flex: 0 0 auto;
+  width: auto;
   white-space: nowrap;
+  align-self: flex-start;
+  margin-top: 2px;
 }
 
 /* ── Snapshot List ── */
@@ -1940,6 +1947,7 @@ button { font: inherit; cursor: pointer; }
   flex-shrink: 0;
 }
 .fallbackCardActions .btn {
+  width: auto;
   padding: 5px 10px;
   font-size: 12px;
   height: auto;
@@ -2139,6 +2147,9 @@ button { font: inherit; cursor: pointer; }
   display: flex;
   align-items: center;
   gap: 10px;
+}
+.settingsActions .btn {
+  width: auto;
 }
 .settingsMeta {
   display: grid;
