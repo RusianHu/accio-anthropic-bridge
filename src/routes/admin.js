@@ -2146,6 +2146,7 @@ button { font: inherit; cursor: pointer; }
 .settingsActions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 10px;
 }
 .settingsActions .btn {
@@ -2156,6 +2157,7 @@ button { font: inherit; cursor: pointer; }
   flex: 1;
   min-width: 0;
   margin: 0;
+  margin-right: auto;
 }
 .settingsMeta {
   display: grid;
