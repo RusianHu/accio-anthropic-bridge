@@ -170,6 +170,38 @@ function resolveSnapshotAuthPayload(alias, accountsPath) {
   };
 }
 
+function findMatchingConfiguredAccount(configuredAccounts, snapshot) {
+  const candidates = new Set([
+    snapshot && snapshot.alias ? String(snapshot.alias) : "",
+    snapshot && snapshot.gatewayUser && snapshot.gatewayUser.id ? String(snapshot.gatewayUser.id) : "",
+    snapshot && snapshot.gatewayUser && snapshot.gatewayUser.name ? String(snapshot.gatewayUser.name) : "",
+    snapshot && snapshot.authPayloadUser && snapshot.authPayloadUser.id ? String(snapshot.authPayloadUser.id) : "",
+    snapshot && snapshot.authPayloadUser && snapshot.authPayloadUser.name ? String(snapshot.authPayloadUser.name) : ""
+  ].filter(Boolean));
+
+  if (candidates.size === 0) {
+    return null;
+  }
+
+  return configuredAccounts.find((account) => {
+    const values = new Set([
+      account && account.id ? String(account.id) : "",
+      account && account.name ? String(account.name) : "",
+      account && account.accountId ? String(account.accountId) : "",
+      account && account.user && account.user.id ? String(account.user.id) : "",
+      account && account.user && account.user.name ? String(account.user.name) : ""
+    ].filter(Boolean));
+
+    for (const candidate of candidates) {
+      if (values.has(candidate)) {
+        return true;
+      }
+    }
+
+    return false;
+  }) || null;
+}
+
 async function requestGatewayJson(gatewayManager, pathname, options = {}) {
   const response = await fetch(`${gatewayManager.baseUrl}${pathname}`, {
     method: options.method || "GET",
@@ -1035,24 +1067,36 @@ async function restartAccioForSnapshot(config, expectedUserId, options = {}) {
 async function buildAdminState(config, authProvider) {
   const gateway = await readGatewayState(config.baseUrl);
   const storage = detectActiveStorage();
+  const configuredAccounts = authProvider.getConfiguredAccounts();
   const snapshotEntries = listSnapshots().map((entry) => {
     const resolvedAuth = resolveSnapshotAuthPayload(entry.alias, config.accountsPath);
     const storedAuthPayload = resolvedAuth.payload;
+    const snapshotBase = {
+      alias: entry.alias,
+      kind: entry.kind,
+      dir: entry.dir,
+      capturedAt: entry.metadata && entry.metadata.capturedAt ? entry.metadata.capturedAt : null,
+      gatewayUser: entry.metadata && entry.metadata.gatewayUser ? entry.metadata.gatewayUser : null,
+      artifactCount: entry.metadata && Array.isArray(entry.metadata.artifacts) ? entry.metadata.artifacts.length : 0,
+      hasFullAuthState: Boolean(entry.metadata && Array.isArray(entry.metadata.artifacts) && entry.metadata.artifacts.length > 1),
+      hasStoredAuthCallback: Boolean(storedAuthPayload),
+      hasAuthCallback: Boolean(entry.hasAuthCallback || storedAuthPayload),
+      authPayloadCapturedAt: entry.authPayloadCapturedAt || (storedAuthPayload && storedAuthPayload.capturedAt ? storedAuthPayload.capturedAt : null),
+      authPayloadUser: entry.authPayloadUser || (storedAuthPayload && storedAuthPayload.user ? storedAuthPayload.user : null)
+    };
+    const matchedAccount = findMatchingConfiguredAccount(configuredAccounts, snapshotBase);
 
     return {
       storedAuthPayload,
       snapshot: {
-        alias: entry.alias,
-        kind: entry.kind,
-        dir: entry.dir,
-        capturedAt: entry.metadata && entry.metadata.capturedAt ? entry.metadata.capturedAt : null,
-        gatewayUser: entry.metadata && entry.metadata.gatewayUser ? entry.metadata.gatewayUser : null,
-        artifactCount: entry.metadata && Array.isArray(entry.metadata.artifacts) ? entry.metadata.artifacts.length : 0,
-        hasFullAuthState: Boolean(entry.metadata && Array.isArray(entry.metadata.artifacts) && entry.metadata.artifacts.length > 1),
-        hasStoredAuthCallback: Boolean(storedAuthPayload),
-        hasAuthCallback: Boolean(entry.hasAuthCallback || storedAuthPayload),
-        authPayloadCapturedAt: entry.authPayloadCapturedAt || (storedAuthPayload && storedAuthPayload.capturedAt ? storedAuthPayload.capturedAt : null),
-        authPayloadUser: entry.authPayloadUser || (storedAuthPayload && storedAuthPayload.user ? storedAuthPayload.user : null)
+        ...snapshotBase,
+        accountState: matchedAccount
+          ? {
+              id: matchedAccount.id,
+              invalidUntil: authProvider.getInvalidUntil(matchedAccount.id),
+              lastFailure: authProvider.getLastFailure(matchedAccount.id) || null
+            }
+          : null
       }
     };
   });
@@ -2131,6 +2175,14 @@ function formatCountdown(seconds) {
 
   return minutes > 0 ? (minutes + ' 分钟') : (total + ' 秒');
 }
+function escapeInline(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 function renderSettings(data) {
   const settings = data && data.settings && data.settings.fallbackOpenAi ? data.settings.fallbackOpenAi : {};
   const configured = Boolean(settings.baseUrl && settings.apiKey && settings.model);
@@ -2174,6 +2226,15 @@ function renderSnapshots(data) {
     const refreshStatus = quota && quota.available && typeof quota.refreshCountdownSeconds === 'number'
       ? formatCountdown(quota.refreshCountdownSeconds)
       : '未知';
+    const accountState = item.accountState || null;
+    const cooling = accountState && typeof accountState.invalidUntil === 'number' && accountState.invalidUntil > Date.now();
+    const cooldownSeconds = cooling ? Math.max(0, Math.ceil((accountState.invalidUntil - Date.now()) / 1000)) : 0;
+    const cooldownStatus = accountState
+      ? (cooling ? ('冷却中，约 ' + formatCountdown(cooldownSeconds) + ' 后恢复') : '正常')
+      : '未关联账号条目';
+    const lastFailure = accountState && accountState.lastFailure && accountState.lastFailure.reason
+      ? escapeInline(accountState.lastFailure.reason)
+      : '';
     return '<div class="' + itemClass + '">'
       + '<div class="itemAvatar">' + avatarChar + '</div>'
       + '<div class="itemTitleRow">'
@@ -2186,6 +2247,9 @@ function renderSnapshots(data) {
       + '<div class="itemMeta">' + formatTime(item.capturedAt) + ' &middot; ' + String(item.artifactCount || 0) + ' 个文件</div>'
       + '<div class="itemMeta">额度状态：' + quotaStatus + '</div>'
       + '<div class="itemMeta">刷新时间：' + refreshStatus + '</div>'
+      + '<div class="itemMeta">直连冷却：' + cooldownStatus + '</div>'
+      + (cooling ? '<div class="itemMeta">恢复时间：' + formatTime(accountState.invalidUntil) + '</div>' : '')
+      + (lastFailure ? '<div class="itemMeta hint">最近失败：' + lastFailure + '</div>' : '')
       + (!item.hasFullAuthState ? '<div class="itemMeta hint">旧格式快照，建议重新登录</div>' : '')
       + (!item.hasAuthCallback ? '<div class="itemMeta hint">缺少原生回调，建议重新登录</div>' : '')
       + '<div class="itemSpacer"></div>'
