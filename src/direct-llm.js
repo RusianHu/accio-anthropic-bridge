@@ -168,6 +168,87 @@ function normalizeToolResultContent(content) {
   return { result: content };
 }
 
+function toPositiveInteger(value) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number) || number <= 0) {
+    return null;
+  }
+
+  return Math.floor(number);
+}
+
+function normalizeAnthropicThinking(thinking, maxTokens) {
+  if (!thinking || typeof thinking !== "object" || thinking.type !== "enabled") {
+    return null;
+  }
+
+  const budgetTokens = toPositiveInteger(thinking.budget_tokens);
+
+  if (!budgetTokens) {
+    return null;
+  }
+
+  const maxOutputTokens = toPositiveInteger(maxTokens);
+
+  return {
+    type: "enabled",
+    budget_tokens: maxOutputTokens
+      ? Math.min(budgetTokens, Math.max(1, maxOutputTokens - 1))
+      : budgetTokens
+  };
+}
+
+function normalizeReasoningEffort(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+
+  if (normalized === "low" || normalized === "medium" || normalized === "high") {
+    return normalized;
+  }
+
+  return null;
+}
+
+function resolveOpenAiThinking(body) {
+  const directThinking = normalizeAnthropicThinking(body.thinking, body.max_tokens);
+
+  if (directThinking) {
+    return directThinking;
+  }
+
+  const reasoning = body.reasoning && typeof body.reasoning === "object" ? body.reasoning : null;
+  const effort = normalizeReasoningEffort(
+    body.reasoning_effort || (reasoning && (reasoning.effort || reasoning.level))
+  );
+
+  if (!effort) {
+    return null;
+  }
+
+  const maxOutputTokens = toPositiveInteger(body.max_tokens);
+
+  if (!maxOutputTokens) {
+    return null;
+  }
+
+  const ratioByEffort = {
+    low: 0.25,
+    medium: 0.5,
+    high: 0.8
+  };
+  let budgetTokens = Math.floor(maxOutputTokens * ratioByEffort[effort]);
+
+  budgetTokens = Math.max(128, budgetTokens);
+  budgetTokens = Math.min(budgetTokens, Math.max(1, maxOutputTokens - 1));
+
+  return budgetTokens > 0
+    ? {
+        type: "enabled",
+        budget_tokens: budgetTokens
+      }
+    : null;
+}
+
 function toAnthropicDirectParts(content, role, toolNameById) {
   const normalized = typeof content === "string" ? [{ type: "text", text: content }] : content;
   const parts = [];
@@ -217,7 +298,8 @@ function toAnthropicDirectParts(content, role, toolNameById) {
 function buildDirectRequestFromAnthropic(body) {
   const toolNameById = buildAnthropicToolNameMap(body.messages);
   const contents = [];
-  const thinking = extractThinkingConfigFromAnthropic(body);
+  const rawThinking = extractThinkingConfigFromAnthropic(body);
+  const thinking = normalizeAnthropicThinking(rawThinking, body.max_tokens) || rawThinking;
   const resolvedModel = mapRequestedModel(body.model, "anthropic");
 
   for (const message of Array.isArray(body.messages) ? body.messages : []) {
@@ -339,6 +421,7 @@ function buildDirectRequestFromOpenAi(body) {
   const toolNameById = buildOpenAiToolNameMap(body.messages);
   const contents = [];
   const resolvedModel = mapRequestedModel(body.model, "openai");
+  const thinking = resolveOpenAiThinking(body);
 
   for (const message of Array.isArray(body.messages) ? body.messages : []) {
     const role = message && message.role === "assistant" ? "model" : "user";
@@ -365,7 +448,8 @@ function buildDirectRequestFromOpenAi(body) {
       ),
       temperature: body.temperature,
       max_output_tokens: body.max_tokens,
-      stop_sequences: Array.isArray(body.stop) ? body.stop : body.stop ? [body.stop] : []
+      stop_sequences: Array.isArray(body.stop) ? body.stop : body.stop ? [body.stop] : [],
+      ...(thinking ? { thinking } : {})
     }
   };
 }
@@ -385,9 +469,11 @@ class DirectResponseAccumulator {
     this.id = null;
     this.text = "";
     this.toolCalls = [];
+    this.thinkingBlocks = [];
     this.stopReason = null;
     this.usage = null;
     this.currentTool = null;
+    this.currentThinking = null;
     this.error = null;
     this.emittedEvents = 0;
   }
@@ -448,6 +534,14 @@ class DirectResponseAccumulator {
     if (raw.type === "content_block_start" && raw.content_block) {
       const block = raw.content_block;
 
+      if (block.type === "thinking") {
+        this.currentThinking = {
+          thinking: typeof block.thinking === "string" ? block.thinking : "",
+          signature: block.signature || null
+        };
+        return;
+      }
+
       if (block.type === "tool_use") {
         this.currentTool = {
           id: block.id || crypto.randomUUID(),
@@ -474,6 +568,16 @@ class DirectResponseAccumulator {
         return;
       }
 
+      if (raw.delta.type === "thinking_delta" && this.currentThinking) {
+        this.currentThinking.thinking += raw.delta.thinking || "";
+        return;
+      }
+
+      if (raw.delta.type === "signature_delta" && this.currentThinking) {
+        this.currentThinking.signature = raw.delta.signature || this.currentThinking.signature;
+        return;
+      }
+
       if (raw.delta.type === "input_json_delta" && this.currentTool) {
         this.currentTool.inputJson += raw.delta.partial_json || "";
       }
@@ -496,6 +600,24 @@ class DirectResponseAccumulator {
       this.emit({ type: "tool_call", toolCall }, onEvent);
 
       this.currentTool = null;
+      return;
+    }
+
+    if (raw.type === "content_block_stop" && this.currentThinking) {
+      const thinkingBlock = {
+        type: "thinking",
+        thinking: this.currentThinking.thinking || ""
+      };
+
+      if (this.currentThinking.signature) {
+        thinkingBlock.signature = this.currentThinking.signature;
+      }
+
+      if (thinkingBlock.thinking || thinkingBlock.signature) {
+        this.thinkingBlocks.push(thinkingBlock);
+      }
+
+      this.currentThinking = null;
       return;
     }
 
@@ -550,6 +672,7 @@ class DirectResponseAccumulator {
       model: this.model,
       finalText: this.text,
       toolCalls: this.toolCalls,
+      thinkingBlocks: this.thinkingBlocks,
       stopReason:
         this.stopReason ||
         (this.toolCalls.length > 0 && !this.text ? "tool_use" : "end_turn"),
