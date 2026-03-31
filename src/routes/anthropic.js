@@ -23,7 +23,7 @@ const { readJsonBody } = require("../middleware/body-parser");
 const { applyAnthropicDefaults, canCacheAnthropicRequest } = require("../request-defaults");
 const { buildCacheKey } = require("../response-cache");
 const { AnthropicStreamWriter } = require("../stream/anthropic-sse");
-const { validateAnthropicMessages } = require("../tooling");
+const { repairAnthropicMessages, validateAnthropicMessages } = require("../tooling");
 const {
   executeBridgeQuery,
   sessionHeaders,
@@ -692,6 +692,7 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackPoo
     await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser),
     client.config
   );
+  body.messages = repairAnthropicMessages(body.messages);
   validateAnthropicMessages(body.messages);
 
   const binding = resolveSessionBinding(req.headers, body, "anthropic");

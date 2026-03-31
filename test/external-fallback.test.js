@@ -11,6 +11,7 @@ const {
   normalizeFallbackTargets,
   openAiMessagesToResponsesInput,
   openAiToFallbackMessages,
+  sanitizeAnthropicRequestBody,
   shouldFallbackToExternalProvider
 } = require("../src/external-fallback");
 
@@ -602,6 +603,113 @@ test("ExternalFallbackClient requestAnthropicMessage preserves body and override
   assert.equal(payload.model, "claude-opus-4-1");
   assert.equal(payload.stream, true);
   assert.deepEqual(payload.thinking, { type: "enabled", budget_tokens: 2048 });
+});
+
+test("sanitizeAnthropicRequestBody strips thinking blocks and normalizes tool_reference tool results", () => {
+  const sanitized = sanitizeAnthropicRequestBody({
+    model: "claude-sonnet-4-6",
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "internal", signature: "sig_1" },
+          { type: "tool_use", id: "tool_1", name: "WebFetch", input: { url: "https://example.com" } }
+        ]
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tool_1",
+            content: [{ type: "tool_reference", tool_name: "WebFetch" }]
+          },
+          { type: "text", text: "continue" }
+        ]
+      }
+    ]
+  });
+
+  assert.deepEqual(sanitized.messages, [
+    {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "tool_1", name: "WebFetch", input: { url: "https://example.com" } }]
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "tool_1",
+          content: "{\"type\":\"tool_reference\",\"tool_name\":\"WebFetch\"}"
+        },
+        { type: "text", text: "continue" }
+      ]
+    }
+  ]);
+});
+
+test("ExternalFallbackClient requestAnthropicMessage sanitizes unsupported anthropic history blocks", async () => {
+  const seen = [];
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "anthropic_key",
+    model: "claude-opus-4-1",
+    protocol: "anthropic",
+    fetchImpl: async (url, options = {}) => {
+      seen.push({ url: String(url), options });
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        async text() {
+          return JSON.stringify({ ok: true });
+        }
+      };
+    }
+  });
+
+  await client.requestAnthropicMessage({
+    model: "should-be-overridden",
+    stream: false,
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "hidden", signature: "sig_1" },
+          { type: "tool_use", id: "tool_1", name: "WebFetch", input: { url: "https://example.com" } }
+        ]
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tool_1",
+            content: [{ type: "tool_reference", tool_name: "WebFetch" }]
+          }
+        ]
+      }
+    ]
+  });
+
+  const payload = JSON.parse(seen[0].options.body);
+  assert.deepEqual(payload.messages, [
+    {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "tool_1", name: "WebFetch", input: { url: "https://example.com" } }]
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "tool_1",
+          content: "{\"type\":\"tool_reference\",\"tool_name\":\"WebFetch\"}"
+        }
+      ]
+    }
+  ]);
 });
 
 test("ExternalFallbackClient accepts anthropic baseUrl ending with /v1", async () => {
