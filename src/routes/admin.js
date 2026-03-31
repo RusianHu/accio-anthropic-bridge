@@ -20,7 +20,7 @@ const {
   readSnapshotAuthPayload,
   writeSnapshotAuthPayload
 } = require("../auth-state");
-const { writeAccountToFile, findStoredAccountAuthPayload } = require("../accounts-file");
+const { writeAccountToFile, findStoredAccountAuthPayload, removeAccountFromFile } = require("../accounts-file");
 const { ExternalFallbackClient, normalizeFallbackTarget, normalizeFallbackTargets, serializeFallbackTarget } = require("../external-fallback");
 const { maskToken } = require("../redaction");
 const log = require("../logger");
@@ -174,6 +174,24 @@ function escapeHtml(value) {
 
 function getSnapshotEntry(alias) {
   return listSnapshots().find((entry) => entry.alias === String(alias || "").trim()) || null;
+}
+
+function hasSnapshotArtifactState(snapshotEntry) {
+  const artifacts = snapshotEntry && snapshotEntry.metadata && Array.isArray(snapshotEntry.metadata.artifacts)
+    ? snapshotEntry.metadata.artifacts
+    : [];
+
+  if (artifacts.length === 0) {
+    return false;
+  }
+
+  const names = new Set(
+    artifacts
+      .map((artifact) => artifact && artifact.relativePath ? String(artifact.relativePath) : "")
+      .filter(Boolean)
+  );
+
+  return names.has("credentials.enc") || names.has("Local Storage") || names.has("Session Storage");
 }
 
 function resolveSnapshotAuthPayload(alias, accountsPath) {
@@ -1176,6 +1194,7 @@ async function buildAdminState(config, authProvider, recentActivityStore) {
   const snapshotEntries = listSnapshots().map((entry) => {
     const resolvedAuth = resolveSnapshotAuthPayload(entry.alias, config.accountsPath);
     const storedAuthPayload = resolvedAuth.payload;
+    const canActivate = hasSnapshotArtifactState(entry);
     const snapshotBase = {
       alias: entry.alias,
       kind: entry.kind,
@@ -1184,6 +1203,7 @@ async function buildAdminState(config, authProvider, recentActivityStore) {
       gatewayUser: entry.metadata && entry.metadata.gatewayUser ? entry.metadata.gatewayUser : null,
       artifactCount: entry.metadata && Array.isArray(entry.metadata.artifacts) ? entry.metadata.artifacts.length : 0,
       hasFullAuthState: Boolean(entry.metadata && Array.isArray(entry.metadata.artifacts) && entry.metadata.artifacts.length > 1),
+      canActivate,
       hasStoredAuthCallback: Boolean(storedAuthPayload),
       hasAuthCallback: Boolean(entry.hasAuthCallback || storedAuthPayload),
       authPayloadCapturedAt: entry.authPayloadCapturedAt || (storedAuthPayload && storedAuthPayload.capturedAt ? storedAuthPayload.capturedAt : null),
@@ -1234,6 +1254,20 @@ async function buildAdminState(config, authProvider, recentActivityStore) {
     invalidUntil: authProvider.getInvalidUntil(account.id),
     lastFailure: authProvider.getLastFailure(account.id) || null
   }));
+  const authSummary = authProvider.getSummary();
+  const usableAccounts = accounts.filter((account) => {
+    if (!account.enabled || !account.hasToken) {
+      return false;
+    }
+
+    if (account.expiresAt && Number(account.expiresAt) <= Date.now()) {
+      return false;
+    }
+
+    return !(account.invalidUntil && Number(account.invalidUntil) > Date.now());
+  });
+  const fileAccountIds = Array.isArray(authSummary.fileAccounts) ? authSummary.fileAccounts.map((value) => String(value)) : [];
+  const envAccountIds = Array.isArray(authSummary.envAccounts) ? authSummary.envAccounts.map((value) => String(value)) : [];
 
   return {
     ok: true,
@@ -1253,7 +1287,17 @@ async function buildAdminState(config, authProvider, recentActivityStore) {
     storage,
     snapshots: normalizedSnapshots,
     currentSnapshot,
-    auth: authProvider.getSummary(),
+    auth: authSummary,
+    authRuntime: {
+      accountsPath: config.accountsPath,
+      totalAccounts: accounts.length,
+      usableAccounts: usableAccounts.length,
+      fileAccounts: fileAccountIds.length,
+      usableFileAccounts: usableAccounts.filter((account) => fileAccountIds.includes(String(account.id))).length,
+      envAccounts: envAccountIds.length,
+      usableEnvAccounts: usableAccounts.filter((account) => envAccountIds.includes(String(account.id))).length,
+      activeAccount: authSummary.activeAccount || null
+    },
     accounts,
     recentActivity: recentActivityStore && typeof recentActivityStore.get === "function"
       ? recentActivityStore.get()
@@ -1475,21 +1519,46 @@ button { font: inherit; cursor: pointer; }
 .dot.bad { background: var(--bad); }
 .kv {
   display: grid;
-  grid-template-columns: 94px minmax(0, 1fr);
-  gap: 14px 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
   margin-top: 12px;
-  font-size: 13px;
 }
-.kv dt {
+.kvItem {
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(24,22,20,0.08);
+  background: rgba(255,255,255,0.62);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.5);
+}
+.kvItem.full {
+  grid-column: 1 / -1;
+}
+.kvKey {
   color: var(--muted);
-  font-weight: 600;
-  letter-spacing: 0.01em;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
-.kv dd {
-  margin: 0;
+.kvValue {
+  margin-top: 4px;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.4;
+  font-weight: 600;
   word-break: break-word;
+}
+.kvValue.subtle {
   color: var(--ink-secondary);
-  line-height: 1.55;
+  font-size: 12px;
+  font-weight: 500;
+}
+.kvValue.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  font-weight: 500;
 }
 
 /* ── Action Panel (topbar slot) ── */
@@ -2355,6 +2424,12 @@ button { font: inherit; cursor: pointer; }
     padding-top: 10px;
     padding-bottom: 18px;
   }
+  .kv {
+    grid-template-columns: 1fr;
+  }
+  .kvItem.full {
+    grid-column: auto;
+  }
   .list {
     grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   }
@@ -2364,7 +2439,7 @@ button { font: inherit; cursor: pointer; }
 <body>
 <div class="pageHeadWrap">
   <nav class="tabbar" aria-label="\u63A7\u5236\u53F0\u5206\u533A">
-    <button class="tabBtn active" type="button" data-tab="accounts">\u8D26\u53F7</button>
+    <button class="tabBtn active" type="button" data-tab="accounts">\u8D26\u53F7\u7BA1\u7406</button>
     <button class="tabBtn" type="button" data-tab="settings">\u4E0A\u6E38\u914D\u7F6E</button>
     <button class="tabBtn" type="button" data-tab="logs">\u65E5\u5FD7</button>
   </nav>
@@ -2376,7 +2451,7 @@ button { font: inherit; cursor: pointer; }
         <div class="statusBadge"><span class="dot" id="gateway-dot"></span><span id="gateway-summary">\u6B63\u5728\u68C0\u67E5\u672C\u5730\u7F51\u5173\u72B6\u6001</span></div>
         <button class="btn-icon" id="refresh-btn" title="\u5237\u65B0\u72B6\u6001">\u21BB</button>
       </div>
-      <dl class="kv" id="overview-kv"></dl>
+      <div class="kv" id="overview-kv"></div>
     </aside>
     <aside class="panel actionPanel">
       <h2>\u8D26\u53F7\u64CD\u4F5C</h2>
@@ -2715,8 +2790,77 @@ function describeRecentActivityCompact(activity) {
   const time = activity.recordedAt ? formatTime(activity.recordedAt) : '';
   return time ? (route + ' · ' + time) : route;
 }
+function describeAuthPoolCompact(data) {
+  const runtime = data && data.authRuntime ? data.authRuntime : null;
+  if (!runtime) {
+    return '未知';
+  }
+
+  const parts = [
+    '已加载 ' + String(runtime.totalAccounts || 0) + ' 个',
+    '可用 ' + String(runtime.usableAccounts || 0) + ' 个'
+  ];
+
+  if ((runtime.fileAccounts || 0) > 0 || (runtime.envAccounts || 0) > 0) {
+    parts.push('文件 ' + String(runtime.fileAccounts || 0) + ' / 环境 ' + String(runtime.envAccounts || 0));
+  }
+
+  return parts.join(' · ');
+}
+function describeRecentAuthCompact(activity) {
+  if (!activity || !activity.transportSelected) {
+    return '暂无最近认证';
+  }
+
+  const transport = String(activity.transportSelected || '');
+  const authSource = activity.authSource ? String(activity.authSource) : '';
+  const accountLabel = activity.accountName || activity.accountId || '';
+
+  if (transport === 'direct-llm') {
+    if (accountLabel) {
+      if (authSource === 'env') {
+        return 'env · ' + accountLabel;
+      }
+
+      return 'file-credential · ' + accountLabel;
+    }
+
+    if (authSource && accountLabel) {
+      return authSource + ' · ' + accountLabel;
+    }
+
+    if (authSource) {
+      return authSource;
+    }
+
+    return 'direct-llm';
+  }
+
+  if (transport === 'external-anthropic' || transport === 'external-openai') {
+    const provider = activity.fallbackProtocol ? String(activity.fallbackProtocol) : transport.replace(/^external-/, '');
+    const model = activity.fallbackModel || activity.resolvedProviderModel || activity.requestedModel || 'unknown';
+    return 'external · ' + provider + ' · ' + model;
+  }
+
+  if (transport === 'local-ws') {
+    return 'local-ws';
+  }
+
+  return transport;
+}
 function renderKv(target, rows) {
-  target.innerHTML = rows.map(([k, v]) => '<dt>' + escapeInline(k) + '</dt><dd>' + escapeInline(v) + '</dd>').join('');
+  const fullWidthKeys = new Set(['账号文件', '当前快照', '运行环境']);
+  target.innerHTML = rows.map(([k, v]) => {
+    const key = String(k || '');
+    const value = String(v || '—');
+    const full = fullWidthKeys.has(key);
+    const mono = key === '账号文件' || value.includes('/') || value.includes('127.0.0.1:');
+    const subtle = value === '暂无最近请求' || value === '暂无最近鉴权' || value === '—' || value === '未知';
+    return '<div class="kvItem' + (full ? ' full' : '') + '">'
+      + '<div class="kvKey">' + escapeInline(key) + '</div>'
+      + '<div class="kvValue' + (mono ? ' mono' : '') + (subtle ? ' subtle' : '') + '">' + escapeInline(value) + '</div>'
+      + '</div>';
+  }).join('');
 }
 function renderCurrentAccountNote(data) {
   if (!els.currentAccountNote) {
@@ -2899,6 +3043,7 @@ function createFallbackDraftTarget(index) {
     baseUrl: '',
     apiKey: '',
     model: '',
+    supportedModels: '',
     reasoningEffort: '',
     anthropicVersion: '2023-06-01',
     timeoutMs: 60000
@@ -2924,6 +3069,9 @@ function normalizeFallbackDraftTarget(target, index) {
     baseUrl: String(target && target.baseUrl ? target.baseUrl : ''),
     apiKey: String(target && target.apiKey ? target.apiKey : ''),
     model: String(target && target.model ? target.model : ''),
+    supportedModels: Array.isArray(target && target.supportedModels)
+      ? target.supportedModels.join(', ')
+      : String(target && target.supportedModels ? target.supportedModels : ''),
     reasoningEffort: ['low', 'medium', 'high'].includes(String(target && target.reasoningEffort ? target.reasoningEffort : '').toLowerCase())
       ? String(target.reasoningEffort).toLowerCase()
       : '',
@@ -2944,6 +3092,7 @@ function collectFallbackDraft() {
     baseUrl: item.querySelector('[data-field=\"baseUrl\"]') ? item.querySelector('[data-field=\"baseUrl\"]').value.trim() : '',
     apiKey: item.querySelector('[data-field=\"apiKey\"]') ? item.querySelector('[data-field=\"apiKey\"]').value.trim() : '',
     model: item.querySelector('[data-field=\"model\"]') ? item.querySelector('[data-field=\"model\"]').value.trim() : '',
+    supportedModels: item.querySelector('[data-field=\"supportedModels\"]') ? item.querySelector('[data-field=\"supportedModels\"]').value.trim() : '',
     reasoningEffort: item.querySelector('[data-field=\"reasoningEffort\"]') ? item.querySelector('[data-field=\"reasoningEffort\"]').value : '',
     anthropicVersion: item.querySelector('[data-field=\"anthropicVersion\"]') ? item.querySelector('[data-field=\"anthropicVersion\"]').value.trim() : '2023-06-01',
     timeoutMs: item.querySelector('[data-field=\"timeoutMs\"]') ? Number(item.querySelector('[data-field=\"timeoutMs\"]').value || 60000) : 60000
@@ -2998,6 +3147,7 @@ function renderFallbackTargets() {
       + '<div class="field wide"><label>Base URL</label><input data-field="baseUrl" type="text" value="' + escapeInline(target.baseUrl) + '" placeholder="https://your-upstream-host/v1" autocomplete="off" /></div>'
       + '<div class="field wide"><label>API Key</label><div class="inputWrap"><input data-field="apiKey" type="password" value="' + escapeInline(target.apiKey) + '" placeholder="sk-..." autocomplete="off" autocapitalize="off" spellcheck="false" /><button class="inputToggle" type="button" data-toggle-secret="' + escapeInline(target.id) + '" aria-label="显示 API Key" title="显示或隐藏 API Key">👁</button></div></div>'
       + '<div class="field"><label>Model</label><input data-field="model" type="text" value="' + escapeInline(target.model) + '" placeholder="gpt-4.1-mini" autocomplete="off" /></div>'
+      + '<div class="field wide"><label>供应模型</label><input data-field="supportedModels" type="text" value="' + escapeInline(target.supportedModels) + '" placeholder="claude-sonnet-4-6, gpt-5.4" autocomplete="off" /></div>'
       + '<div class="field"><label>默认推理级别</label><select data-field="reasoningEffort"><option value=""' + (!target.reasoningEffort ? ' selected' : '') + '>自动</option><option value="low"' + (target.reasoningEffort === 'low' ? ' selected' : '') + '>low</option><option value="medium"' + (target.reasoningEffort === 'medium' ? ' selected' : '') + '>medium</option><option value="high"' + (target.reasoningEffort === 'high' ? ' selected' : '') + '>high</option></select></div>'
       + '<div class="field"><label>Anthropic Version</label><input data-field="anthropicVersion" type="text" value="' + escapeInline(target.anthropicVersion || '2023-06-01') + '" placeholder="2023-06-01" autocomplete="off" /></div>'
       + '<div class="field"><label>Timeout (ms)</label><input data-field="timeoutMs" type="number" min="1000" step="1000" value="' + escapeInline(String(target.timeoutMs || 60000)) + '" /></div>'
@@ -3038,6 +3188,7 @@ function renderSnapshots(data) {
     const statusPill = item.hasFullAuthState && item.hasAuthCallback
       ? '<span class="pill current">完整</span>'
       : (!item.hasFullAuthState ? '<span class="pill warn">旧快照</span>' : '<span class="pill warn">仅文件</span>');
+    const canActivate = item.canActivate !== false;
     const quota = item.quota || null;
     const quotaStatus = quota && quota.available && typeof quota.usagePercent === 'number'
       ? ('已用 ' + Math.round(quota.usagePercent) + '%')
@@ -3079,8 +3230,9 @@ function renderSnapshots(data) {
       + (lastFailure ? '<div class="itemMeta hint">最近失败：' + lastFailure + '</div>' : '')
       + (!item.hasFullAuthState ? '<div class="itemMeta hint">旧格式快照，建议重新登录</div>' : '')
       + (!item.hasAuthCallback ? '<div class="itemMeta hint">缺少原生回调，建议重新登录</div>' : '')
+      + (!canActivate ? '<div class="itemMeta hint">该快照缺少完整登录槽位，不能直接切换。</div>' : '')
       + '<div class="itemSpacer"></div>'
-      + '<div class="actionRow"><button class="btn" data-activate-snapshot="' + item.alias + '">切换</button><button class="btn" data-delete-snapshot="' + item.alias + '">删除</button></div>'
+      + '<div class="actionRow"><button class="btn" data-activate-snapshot="' + item.alias + '"' + (canActivate ? '' : ' disabled title="请重新登录该账号后重新保存"') + '>' + (canActivate ? '切换' : '需补全') + '</button><button class="btn" data-delete-snapshot="' + item.alias + '">删除</button></div>'
       + '</div>';
   }).join('');
 }
@@ -3088,14 +3240,20 @@ function renderState(data, options = {}) {
   const recentActivity = data && data.recentActivity ? data.recentActivity : null;
   const [dotClass, summary] = recentActivityBadge(recentActivity, data.gateway);
   const [, gatewaySummary] = badgeState(data.gateway);
+  const accountsPath = data && data.authRuntime && data.authRuntime.accountsPath
+    ? String(data.authRuntime.accountsPath)
+    : (data && data.bridge && data.bridge.accountsPath ? String(data.bridge.accountsPath) : '—');
   els.gatewayDot.className = 'dot ' + dotClass;
   els.gatewaySummary.textContent = summary;
   renderKv(els.overviewKv, [
     ['最近请求', describeRecentActivityCompact(recentActivity)],
+    ['最近认证来源', describeRecentAuthCompact(recentActivity)],
     ['当前网关', gatewaySummary + ' · ' + describeGatewayIdentity(data.gateway)],
-    ['账号池', describeAccountsCompact(data)],
-    ['当前快照', describeSnapshotCompact(data.currentSnapshot)],
-    ['运行环境', describeRuntimeCompact(data)]
+    ['账号快照', describeAccountsCompact(data)],
+    ['凭证池', describeAuthPoolCompact(data)],
+    ['账号文件', accountsPath],
+    ['当前网关快照', describeSnapshotCompact(data.currentSnapshot)],
+    ['本地存储', describeRuntimeCompact(data)]
   ]);
   renderCurrentAccountNote(data);
   renderSnapshots(data);
@@ -3181,8 +3339,8 @@ async function pollAccountLogin(flowId) {
         : (payload.gatewayState.authenticated ? '已登录但未返回用户ID' : '未登录');
       renderKv(els.overviewKv, [
         ['当前网关', currentText],
-        ['账号池', els.snapshotList.children ? (String(els.snapshotList.children.length) + ' 个账号') : '—'],
-        ['运行环境', ['同步中', payload.gatewayState.baseUrl || '—'].filter(Boolean).join(' · ')]
+        ['账号快照', els.snapshotList.children ? (String(els.snapshotList.children.length) + ' 个账号') : '—'],
+        ['本地存储', ['同步中', payload.gatewayState.baseUrl || '—'].filter(Boolean).join(' · ')]
       ]);
     }
 
@@ -3370,16 +3528,24 @@ document.addEventListener('click', async (event) => {
     delete remove.dataset.confirmDelete;
     await withAction(remove, async () => {
       clearMessage();
-      await api('/admin/api/snapshots/delete', { method: 'POST', body: { alias: aliasToDelete } });
+      const payload = await api('/admin/api/snapshots/delete', {
+        method: 'POST',
+        body: { alias: aliasToDelete, deleteCredential: true }
+      });
       await refreshState();
-      setMessage('ok', '已删除账号记录：' + aliasToDelete);
+      setMessage(
+        'ok',
+        payload && payload.deletedCredential
+          ? ('已删除账号快照和号池凭证：' + aliasToDelete)
+          : ('已删除账号快照：' + aliasToDelete)
+      );
     });
     return;
   }
 
   remove.dataset.confirmDelete = '1';
   const prevText = remove.textContent;
-  remove.textContent = '确认删除？';
+  remove.textContent = '删快照+凭证？';
   remove.classList.add('danger-confirm');
   setTimeout(() => {
     if (remove.dataset.confirmDelete) {
@@ -3814,17 +3980,33 @@ async function handleAdminSnapshotActivate(req, res, config, gatewayManager) {
   }
 
   const gatewayBefore = await readGatewayState(config.baseUrl);
+  const snapshotEntry = getSnapshotEntry(alias);
+  if (!snapshotEntry) {
+    writeJson(res, 404, { error: { type: "not_found_error", message: `snapshot not found for alias: ${alias}` } });
+    return;
+  }
+  const preferArtifactRestore = hasSnapshotArtifactState(snapshotEntry);
+  if (!preferArtifactRestore) {
+    writeJson(res, 400, {
+      error: {
+        type: "invalid_request_error",
+        message: "该快照缺少完整登录槽位，无法切换。请重新登录该账号后重新保存。"
+      }
+    });
+    return;
+  }
   const resolvedAuth = resolveSnapshotAuthPayload(alias, config.accountsPath);
   const authPayload = resolvedAuth.payload;
   const authPayloadSource = resolvedAuth.source;
   log.info("snapshot switch requested", {
     alias,
     gatewayBefore: summarizeGatewayState(gatewayBefore),
+    preferArtifactRestore,
     hasAuthCallback: Boolean(authPayload),
     authPayloadSource: authPayloadSource || null
   });
 
-  if (authPayload && authPayload.accessToken && authPayload.refreshToken && (authPayload.expiresAtRaw || authPayload.expiresAtMs)) {
+  if (!preferArtifactRestore && authPayload && authPayload.accessToken && authPayload.refreshToken && (authPayload.expiresAtRaw || authPayload.expiresAtMs)) {
     const expectedUserId = authPayload.user && authPayload.user.id
       ? String(authPayload.user.id)
       : "";
@@ -3845,6 +4027,7 @@ async function handleAdminSnapshotActivate(req, res, config, gatewayManager) {
         manualRelaunchRequired: false,
         usedAuthCallback: true,
         authPayloadSource: authPayloadSource || null,
+        switchStrategy: "callback-replay",
         note: `当前已经是账号 ${expectedUserId}，无需切换。`
       });
       return;
@@ -3920,6 +4103,7 @@ async function handleAdminSnapshotActivate(req, res, config, gatewayManager) {
       manualRelaunchRequired: false,
       usedAuthCallback: true,
       authPayloadSource: authPayloadSource || null,
+      switchStrategy: "callback-replay",
       note: switched
         ? "已通过原生回调凭证切换账号。"
         : "已重放该账号的原生回调凭证，但尚未确认切换到目标账号。请重新登录该账号以刷新记录。"
@@ -3987,6 +4171,7 @@ async function handleAdminSnapshotActivate(req, res, config, gatewayManager) {
     appRestarted,
     manualRelaunchRequired,
     usedAuthCallback: false,
+    switchStrategy: preferArtifactRestore ? "artifact-restore" : "legacy-artifact-restore",
     note: switched
       ? "已恢复快照并重启 Accio，当前账号已切换。"
       : legacySnapshot
@@ -3998,16 +4183,26 @@ async function handleAdminSnapshotActivate(req, res, config, gatewayManager) {
 }
 
 
-async function handleAdminSnapshotDelete(req, res) {
+async function handleAdminSnapshotDelete(req, res, config) {
   const body = await readJsonBody(req, req.bridgeContext && req.bridgeContext.bodyParser ? req.bridgeContext.bodyParser : {});
   const alias = body && body.alias ? String(body.alias).trim() : "";
+  const deleteCredential = !(body && body.deleteCredential === false);
   if (!alias) {
     writeJson(res, 400, { error: { type: "invalid_request_error", message: "alias is required" } });
     return;
   }
   const result = deleteSnapshot(alias);
+  const accountRemoval = deleteCredential
+    ? removeAccountFromFile(config.accountsPath, { alias })
+    : { removed: false, path: config.accountsPath, removedAccounts: [] };
   invalidateSharedAdminState();
-  writeJson(res, 200, { ok: true, alias: result.alias });
+  writeJson(res, 200, {
+    ok: true,
+    alias: result.alias,
+    deletedCredential: Boolean(accountRemoval && accountRemoval.removed),
+    accountsPath: accountRemoval && accountRemoval.path ? accountRemoval.path : config.accountsPath,
+    removedAccounts: accountRemoval && Array.isArray(accountRemoval.removedAccounts) ? accountRemoval.removedAccounts : []
+  });
 }
 
 async function handleAdminGatewayLogin(req, res, gatewayManager) {
@@ -4324,6 +4519,7 @@ module.exports = {
   handleAdminAccountCallback,
   handleAdminAccountLoginStatus,
   __private__: {
+    hasSnapshotArtifactState,
     isQuotaPendingFailure,
     readSnapshotQuotaState,
     requestQuotaViaUpstream,

@@ -240,7 +240,7 @@ function createServer(config, client, directClient, fallbackPool, authProvider, 
       }
 
       if (req.method === "POST" && url.pathname === "/admin/api/snapshots/delete") {
-        await handleAdminSnapshotDelete(req, res);
+        await handleAdminSnapshotDelete(req, res, config);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
         return;
       }

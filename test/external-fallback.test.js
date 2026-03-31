@@ -64,7 +64,15 @@ test("ExternalFallbackClient eligibility allows anthropic tools for openai-compa
 
 test("normalizeFallbackTargets preserves order and normalizes ids", () => {
   const targets = normalizeFallbackTargets([
-    { name: "Primary", protocol: "anthropic", baseUrl: "https://a.example/v1/", apiKey: "k1", model: "m1", reasoningEffort: "high" },
+    {
+      name: "Primary",
+      protocol: "anthropic",
+      baseUrl: "https://a.example/v1/",
+      apiKey: "k1",
+      model: "m1",
+      supportedModels: "claude-sonnet-4-5, claude-opus-4-6",
+      reasoningEffort: "high"
+    },
     { name: "Secondary", protocol: "openai", baseUrl: "https://b.example/v1", apiKey: "k2", model: "m2", enabled: false }
   ]);
 
@@ -73,27 +81,62 @@ test("normalizeFallbackTargets preserves order and normalizes ids", () => {
   assert.equal(targets[0].protocol, "anthropic");
   assert.equal(targets[0].baseUrl, "https://a.example/v1");
   assert.equal(targets[0].reasoningEffort, "high");
+  assert.deepEqual(targets[0].supportedModels, ["claude-sonnet-4-6", "claude-opus-4-6"]);
   assert.ok(targets[0].id);
 });
 
-test("ExternalFallbackPool returns eligible candidates in configured order", () => {
+test("ExternalFallbackPool prioritizes native model matches before protocol adaptation", () => {
   const pool = new ExternalFallbackPool({
     targets: [
-      { id: "a", name: "A", protocol: "openai", baseUrl: "https://a.example/v1", apiKey: "k1", model: "m1" },
-      { id: "b", name: "B", protocol: "anthropic", baseUrl: "https://b.example/v1", apiKey: "k2", model: "m2" }
+      {
+        id: "a",
+        name: "A",
+        protocol: "openai",
+        baseUrl: "https://a.example/v1",
+        apiKey: "k1",
+        model: "gpt-5.4",
+        supportedModels: ["gpt-5.4"]
+      },
+      {
+        id: "b",
+        name: "B",
+        protocol: "anthropic",
+        baseUrl: "https://b.example/v1",
+        apiKey: "k2",
+        model: "anthropic/claude-sonnet-4.6",
+        supportedModels: ["claude-sonnet-4-6"]
+      }
     ]
   });
 
   const anthropicCandidates = pool.getEligibleAnthropic({
+    model: "claude-sonnet-4-5",
     messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
     thinking: { type: "enabled" }
   });
   const openAiCandidates = pool.getEligibleOpenAi({
+    model: "gpt-5.4",
     messages: [{ role: "user", content: "hi" }]
   });
 
-  assert.deepEqual(anthropicCandidates.map((entry) => entry.target.id), ["a", "b"]);
+  assert.deepEqual(anthropicCandidates.map((entry) => entry.target.id), ["b", "a"]);
   assert.deepEqual(openAiCandidates.map((entry) => entry.target.id), ["a", "b"]);
+});
+
+test("ExternalFallbackPool keeps configured priority when no native model supplier matches", () => {
+  const pool = new ExternalFallbackPool({
+    targets: [
+      { id: "a", name: "A", protocol: "openai", baseUrl: "https://a.example/v1", apiKey: "k1", model: "gpt-5.4", supportedModels: ["gpt-5.4"] },
+      { id: "b", name: "B", protocol: "anthropic", baseUrl: "https://b.example/v1", apiKey: "k2", model: "anthropic/claude-sonnet-4.6", supportedModels: ["claude-sonnet-4-6"] }
+    ]
+  });
+
+  const candidates = pool.getEligibleAnthropic({
+    model: "claude-haiku-4-5",
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }]
+  });
+
+  assert.deepEqual(candidates.map((entry) => entry.target.id), ["a", "b"]);
 });
 
 test("ExternalFallbackClient completes through OpenAI compatible endpoint", async () => {

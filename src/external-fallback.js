@@ -1,7 +1,9 @@
 "use strict";
 
+const modelAliases = require("../config/model-aliases.json");
 const log = require("./logger");
 const { flattenAnthropicRequest, normalizeContent, normalizeSystemPrompt } = require("./anthropic");
+const { normalizeRequestedModel } = require("./model");
 const { flattenOpenAiRequest } = require("./openai");
 
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
@@ -68,6 +70,41 @@ function stripTrailingSlash(value) {
   return String(value || "").trim().replace(/\/$/, "");
 }
 
+function normalizeSupportedModelId(value) {
+  const requested = normalizeRequestedModel(value);
+  if (!requested) {
+    return "";
+  }
+
+  return String(modelAliases[requested] || requested).trim();
+}
+
+function normalizeSupportedModels(value, fallbackModel = "") {
+  const rawValues = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[\n,]+/)
+      : [];
+  const seen = new Set();
+  const normalized = [];
+
+  for (const item of rawValues) {
+    const model = normalizeSupportedModelId(item);
+    if (!model || seen.has(model)) {
+      continue;
+    }
+    seen.add(model);
+    normalized.push(model);
+  }
+
+  const fallback = normalizeSupportedModelId(fallbackModel);
+  if (normalized.length === 0 && fallback) {
+    normalized.push(fallback);
+  }
+
+  return normalized;
+}
+
 function normalizeFallbackTarget(target = {}, index = 0) {
   const selection = normalizeProtocolSelection(target.protocol, target.openaiApiStyle);
 
@@ -78,6 +115,7 @@ function normalizeFallbackTarget(target = {}, index = 0) {
     baseUrl: stripTrailingSlash(target.baseUrl || ""),
     apiKey: String(target.apiKey || "").trim(),
     model: String(target.model || "").trim(),
+    supportedModels: normalizeSupportedModels(target.supportedModels, target.model),
     protocol: selection.protocol,
     openaiApiStyle: selection.openaiApiStyle,
     anthropicVersion: String(target.anthropicVersion || DEFAULT_ANTHROPIC_VERSION).trim() || DEFAULT_ANTHROPIC_VERSION,
@@ -103,6 +141,7 @@ function serializeFallbackTarget(target = {}) {
     baseUrl: normalized.baseUrl,
     apiKey: normalized.apiKey,
     model: normalized.model,
+    supportedModels: normalized.supportedModels,
     protocol,
     anthropicVersion: normalized.anthropicVersion,
     timeoutMs: normalized.timeoutMs,
@@ -1100,6 +1139,7 @@ class ExternalFallbackClient {
     this.baseUrl = stripTrailingSlash(config.baseUrl || "");
     this.apiKey = String(config.apiKey || "");
     this.model = String(config.model || "");
+    this.supportedModels = normalizeSupportedModels(config.supportedModels, this.model);
     this.timeoutMs = Number(config.timeoutMs || 60000);
     this.protocol = String(config.protocol || "openai").toLowerCase() === "anthropic" ? "anthropic" : "openai";
     this.openaiApiStyle = normalizeOpenAiApiStyle(config.openaiApiStyle);
@@ -1117,6 +1157,15 @@ class ExternalFallbackClient {
 
   transportName() {
     return this.protocol === "anthropic" ? "external-anthropic" : "external-openai";
+  }
+
+  supportsRequestedModel(requestedModel) {
+    const normalized = normalizeSupportedModelId(requestedModel);
+    if (!normalized || this.supportedModels.length === 0) {
+      return false;
+    }
+
+    return this.supportedModels.includes(normalized);
   }
 
   buildAnthropicMessageUrls() {
@@ -1736,15 +1785,31 @@ class ExternalFallbackPool {
   }
 
   getEligibleAnthropic(body) {
-    return this.entries.filter((entry) => entry.client.isEligibleAnthropic(body));
+    return this._rankEntriesByRequestedModel(
+      this.entries.filter((entry) => entry.client.isEligibleAnthropic(body)),
+      body && body.model
+    );
   }
 
   getEligibleOpenAi(body) {
-    return this.entries.filter((entry) => entry.client.isEligibleOpenAi(body));
+    return this._rankEntriesByRequestedModel(
+      this.entries.filter((entry) => entry.client.isEligibleOpenAi(body)),
+      body && body.model
+    );
   }
 
   getConfiguredEntries() {
     return this.entries.filter((entry) => entry.client.isConfigured());
+  }
+
+  _rankEntriesByRequestedModel(entries, requestedModel) {
+    const nativeMatches = entries.filter((entry) => entry.client.supportsRequestedModel(requestedModel));
+    if (nativeMatches.length === 0) {
+      return entries;
+    }
+
+    const matchedIds = new Set(nativeMatches.map((entry) => entry.target.id));
+    return nativeMatches.concat(entries.filter((entry) => !matchedIds.has(entry.target.id)));
   }
 }
 
