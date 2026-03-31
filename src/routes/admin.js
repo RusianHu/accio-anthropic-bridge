@@ -2696,18 +2696,20 @@ function describeRecentActivity(activity) {
   }
 
   if (transport === 'local-ws') {
-    return 'Accio local-ws';
+    return 'Accio local-ws · ' + model;
   }
 
   if (transport === 'direct-llm') {
     if (accountLabel) {
-      return '号池直连 · ' + accountLabel;
+      return '号池直连 · ' + accountLabel + ' · ' + model;
     }
 
-    return '本地网关直连';
+    return '本地网关直连 · ' + model;
   }
 
-  return transport;
+  return model && model !== 'unknown'
+    ? (transport + ' · ' + model)
+    : transport;
 }
 function recentActivityBadge(activity, gateway) {
   if (!activity || !activity.transportSelected) {
@@ -2754,6 +2756,13 @@ function describeGatewayIdentity(gateway) {
 
   return userName || userId || '网关已登录';
 }
+function describeGatewayCompact(gateway) {
+  const status = badgeState(gateway)[1];
+  const identity = describeGatewayIdentity(gateway);
+  return identity && identity !== status
+    ? (status + ' · ' + identity)
+    : status;
+}
 function describeSnapshotCompact(snapshot) {
   if (!snapshot) {
     return '无';
@@ -2773,13 +2782,7 @@ function describeRuntimeCompact(data) {
 }
 function describeAccountsCompact(data) {
   const count = Array.isArray(data && data.snapshots) ? data.snapshots.length : 0;
-  const currentSnapshot = data && data.currentSnapshot ? data.currentSnapshot : null;
-  const currentLabel = currentSnapshot && currentSnapshot.gatewayUser
-    ? (currentSnapshot.gatewayUser.name || currentSnapshot.gatewayUser.id || currentSnapshot.alias)
-    : null;
-  return currentLabel
-    ? (String(count) + ' 个账号 · 当前 ' + currentLabel)
-    : (String(count) + ' 个账号');
+  return String(count) + ' 个已记录快照';
 }
 function describeRecentActivityCompact(activity) {
   if (!activity || !activity.transportSelected) {
@@ -3240,19 +3243,12 @@ function renderState(data, options = {}) {
   const recentActivity = data && data.recentActivity ? data.recentActivity : null;
   const [dotClass, summary] = recentActivityBadge(recentActivity, data.gateway);
   const [, gatewaySummary] = badgeState(data.gateway);
-  const accountsPath = data && data.authRuntime && data.authRuntime.accountsPath
-    ? String(data.authRuntime.accountsPath)
-    : (data && data.bridge && data.bridge.accountsPath ? String(data.bridge.accountsPath) : '—');
   els.gatewayDot.className = 'dot ' + dotClass;
   els.gatewaySummary.textContent = summary;
   renderKv(els.overviewKv, [
     ['最近请求', describeRecentActivityCompact(recentActivity)],
-    ['最近认证来源', describeRecentAuthCompact(recentActivity)],
-    ['当前网关', gatewaySummary + ' · ' + describeGatewayIdentity(data.gateway)],
-    ['账号快照', describeAccountsCompact(data)],
-    ['凭证池', describeAuthPoolCompact(data)],
-    ['账号文件', accountsPath],
-    ['当前网关快照', describeSnapshotCompact(data.currentSnapshot)],
+    ['当前网关', describeGatewayCompact(data.gateway)],
+    ['快照数量', describeAccountsCompact(data)],
     ['本地存储', describeRuntimeCompact(data)]
   ]);
   renderCurrentAccountNote(data);
@@ -3339,7 +3335,7 @@ async function pollAccountLogin(flowId) {
         : (payload.gatewayState.authenticated ? '已登录但未返回用户ID' : '未登录');
       renderKv(els.overviewKv, [
         ['当前网关', currentText],
-        ['账号快照', els.snapshotList.children ? (String(els.snapshotList.children.length) + ' 个账号') : '—'],
+        ['快照数量', els.snapshotList.children ? (String(els.snapshotList.children.length) + ' 个已记录快照') : '—'],
         ['本地存储', ['同步中', payload.gatewayState.baseUrl || '—'].filter(Boolean).join(' · ')]
       ]);
     }
@@ -3986,15 +3982,6 @@ async function handleAdminSnapshotActivate(req, res, config, gatewayManager) {
     return;
   }
   const preferArtifactRestore = hasSnapshotArtifactState(snapshotEntry);
-  if (!preferArtifactRestore) {
-    writeJson(res, 400, {
-      error: {
-        type: "invalid_request_error",
-        message: "该快照缺少完整登录槽位，无法切换。请重新登录该账号后重新保存。"
-      }
-    });
-    return;
-  }
   const resolvedAuth = resolveSnapshotAuthPayload(alias, config.accountsPath);
   const authPayload = resolvedAuth.payload;
   const authPayloadSource = resolvedAuth.source;
@@ -4006,7 +3993,27 @@ async function handleAdminSnapshotActivate(req, res, config, gatewayManager) {
     authPayloadSource: authPayloadSource || null
   });
 
-  if (!preferArtifactRestore && authPayload && authPayload.accessToken && authPayload.refreshToken && (authPayload.expiresAtRaw || authPayload.expiresAtMs)) {
+  const canReplayAuthCallback = Boolean(
+    authPayload &&
+    authPayload.accessToken &&
+    authPayload.refreshToken &&
+    (authPayload.expiresAtRaw || authPayload.expiresAtMs)
+  );
+  let callbackReplayAttempted = false;
+  let callbackReplayFallbackReason = "";
+
+  if (!preferArtifactRestore && !canReplayAuthCallback) {
+    writeJson(res, 400, {
+      error: {
+        type: "invalid_request_error",
+        message: "该快照缺少完整登录槽位，且没有可用的原生回调凭证，无法切换。请重新登录该账号后重新保存。"
+      }
+    });
+    return;
+  }
+
+  if (canReplayAuthCallback) {
+    callbackReplayAttempted = true;
     const expectedUserId = authPayload.user && authPayload.user.id
       ? String(authPayload.user.id)
       : "";
@@ -4046,69 +4053,105 @@ async function handleAdminSnapshotActivate(req, res, config, gatewayManager) {
         error: message,
         expectedUserId: expectedUserId || null
       });
-      writeJson(res, 502, {
-        ok: false,
-        alias,
-        error: {
-          type: "upstream_refresh_failed",
-          message: `未能用目标账号 refreshToken 建立上游绑定：${message}`
-        }
-      });
-      return;
-    }
 
-    if (gatewayBefore && gatewayBefore.reachable && gatewayBefore.authenticated) {
-      await requestGatewayJson(gatewayManager, "/auth/logout", { method: "POST", body: {} }).catch((error) => {
-        log.warn("snapshot switch logout before callback replay failed", {
+      if (!preferArtifactRestore) {
+        writeJson(res, 502, {
+          ok: false,
           alias,
-          error: error && error.message ? error.message : String(error)
+          error: {
+            type: "upstream_refresh_failed",
+            message: `未能用目标账号 refreshToken 建立上游绑定：${message}`
+          }
         });
+        return;
+      }
+
+      callbackReplayFallbackReason = `callback_refresh_failed:${message}`;
+      log.info("snapshot switch falling back to artifact restore after callback refresh failure", {
+        alias,
+        expectedUserId: expectedUserId || null
       });
     }
 
-    await forwardGatewayAuthCallback(gatewayManager, primedAuthPayload, { includeState: false, timeoutMs: 20000 });
-    const gatewayAfter = await waitForGatewayAuthenticatedUser(config.baseUrl, expectedUserId, 20000, 500);
-    const currentUserId = extractGatewayUserId(gatewayAfter);
-    const switched = Boolean(gatewayAfter && gatewayAfter.reachable && gatewayAfter.authenticated && (!expectedUserId || currentUserId === expectedUserId));
+    if (!callbackReplayFallbackReason) {
+      if (gatewayBefore && gatewayBefore.reachable && gatewayBefore.authenticated) {
+        await requestGatewayJson(gatewayManager, "/auth/logout", { method: "POST", body: {} }).catch((error) => {
+          log.warn("snapshot switch logout before callback replay failed", {
+            alias,
+            error: error && error.message ? error.message : String(error)
+          });
+        });
+      }
 
-    if (switched) {
-      const refreshedAuth = {
-        ...primedAuthPayload,
-        user: gatewayAfter && gatewayAfter.user ? gatewayAfter.user : primedAuthPayload.user || null,
-        source: "gateway-auth-callback"
-      };
-      snapshotActiveCredentials(alias, {
-        gatewayUser: refreshedAuth.user,
-        notes: "refreshed after gateway auth callback replay",
-        authPayload: refreshedAuth
-      });
-      writeSnapshotAuthPayload(alias, refreshedAuth);
-      writeAccountToFile(config.accountsPath, alias, refreshedAuth.accessToken, {
-        user: refreshedAuth.user,
-        expiresAtMs: refreshedAuth.expiresAtMs,
-        expiresAtRaw: refreshedAuth.expiresAtRaw,
-        source: "gateway-auth-callback",
-        authPayload: refreshedAuth
+      await forwardGatewayAuthCallback(gatewayManager, primedAuthPayload, { includeState: false, timeoutMs: 20000 });
+      const gatewayAfter = await waitForGatewayAuthenticatedUser(config.baseUrl, expectedUserId, 20000, 500);
+      const currentUserId = extractGatewayUserId(gatewayAfter);
+      const switched = Boolean(gatewayAfter && gatewayAfter.reachable && gatewayAfter.authenticated && (!expectedUserId || currentUserId === expectedUserId));
+
+      if (switched) {
+        const refreshedAuth = {
+          ...primedAuthPayload,
+          user: gatewayAfter && gatewayAfter.user ? gatewayAfter.user : primedAuthPayload.user || null,
+          source: "gateway-auth-callback"
+        };
+        snapshotActiveCredentials(alias, {
+          gatewayUser: refreshedAuth.user,
+          notes: "refreshed after gateway auth callback replay",
+          authPayload: refreshedAuth
+        });
+        writeSnapshotAuthPayload(alias, refreshedAuth);
+        writeAccountToFile(config.accountsPath, alias, refreshedAuth.accessToken, {
+          user: refreshedAuth.user,
+          expiresAtMs: refreshedAuth.expiresAtMs,
+          expiresAtRaw: refreshedAuth.expiresAtRaw,
+          source: "gateway-auth-callback",
+          authPayload: refreshedAuth
+        });
+
+        invalidateSharedAdminState();
+        writeJson(res, 200, {
+          ok: true,
+          alias,
+          switched,
+          currentUserId: currentUserId || null,
+          expectedUserId: expectedUserId || null,
+          appRestarted: false,
+          manualRelaunchRequired: false,
+          usedAuthCallback: true,
+          authPayloadSource: authPayloadSource || null,
+          switchStrategy: "callback-replay",
+          note: "已通过原生回调凭证切换账号。"
+        });
+        return;
+      }
+
+      if (!preferArtifactRestore) {
+        invalidateSharedAdminState();
+        writeJson(res, 200, {
+          ok: true,
+          alias,
+          switched,
+          currentUserId: currentUserId || null,
+          expectedUserId: expectedUserId || null,
+          appRestarted: false,
+          manualRelaunchRequired: false,
+          usedAuthCallback: true,
+          authPayloadSource: authPayloadSource || null,
+          switchStrategy: "callback-replay",
+          note: "已重放该账号的原生回调凭证，但尚未确认切换到目标账号。请重新登录该账号以刷新记录。"
+        });
+        return;
+      }
+
+      callbackReplayFallbackReason = expectedUserId
+        ? `callback_user_mismatch:${currentUserId || "unknown"}!=${expectedUserId}`
+        : "callback_unconfirmed";
+      log.info("snapshot switch falling back to artifact restore after callback replay did not confirm target user", {
+        alias,
+        expectedUserId: expectedUserId || null,
+        currentUserId: currentUserId || null
       });
     }
-
-    invalidateSharedAdminState();
-    writeJson(res, 200, {
-      ok: true,
-      alias,
-      switched,
-      currentUserId: currentUserId || null,
-      expectedUserId: expectedUserId || null,
-      appRestarted: false,
-      manualRelaunchRequired: false,
-      usedAuthCallback: true,
-      authPayloadSource: authPayloadSource || null,
-      switchStrategy: "callback-replay",
-      note: switched
-        ? "已通过原生回调凭证切换账号。"
-        : "已重放该账号的原生回调凭证，但尚未确认切换到目标账号。请重新登录该账号以刷新记录。"
-    });
-    return;
   }
 
   const processName = normalizeAccioProcessName(config.appPath);
@@ -4154,6 +4197,8 @@ async function handleAdminSnapshotActivate(req, res, config, gatewayManager) {
     legacySnapshot,
     appRestarted,
     manualRelaunchRequired,
+    callbackReplayAttempted,
+    callbackReplayFallbackReason: callbackReplayFallbackReason || null,
     gatewayAfter: summarizeGatewayState(restart.gateway)
   });
 
@@ -4171,6 +4216,8 @@ async function handleAdminSnapshotActivate(req, res, config, gatewayManager) {
     appRestarted,
     manualRelaunchRequired,
     usedAuthCallback: false,
+    callbackReplayAttempted,
+    callbackReplayFallbackReason: callbackReplayFallbackReason || null,
     switchStrategy: preferArtifactRestore ? "artifact-restore" : "legacy-artifact-restore",
     note: switched
       ? "已恢复快照并重启 Accio，当前账号已切换。"
