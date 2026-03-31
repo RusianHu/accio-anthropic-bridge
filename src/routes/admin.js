@@ -1877,6 +1877,108 @@ button { font: inherit; cursor: pointer; }
 .topbar.tabScopedHidden {
   display: none;
 }
+.logsPanel {
+  display: grid;
+  gap: 14px;
+  max-width: 920px;
+}
+.logsToolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.logsMeta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 12px;
+}
+.logsActions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.logsViewport {
+  min-height: 420px;
+  max-height: 68vh;
+  overflow: auto;
+  border-radius: 16px;
+  border: 1px solid rgba(24,22,20,0.08);
+  background: #14110f;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+}
+.logEmpty {
+  padding: 22px 20px;
+  color: rgba(255,255,255,0.58);
+  font-size: 12px;
+}
+.logList {
+  display: grid;
+}
+.logEntry {
+  display: grid;
+  gap: 6px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  font-family: ui-monospace, "SF Mono", monospace;
+  color: rgba(255,255,255,0.92);
+}
+.logEntry:last-child {
+  border-bottom: 0;
+}
+.logEntry[data-level="debug"] {
+  color: rgba(177,197,255,0.86);
+}
+.logEntry[data-level="info"] {
+  color: rgba(240,236,228,0.92);
+}
+.logEntry[data-level="warn"] {
+  color: #ffd37d;
+}
+.logEntry[data-level="error"] {
+  color: #ff9d9d;
+}
+.logEntryHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.logLevel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 48px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.08);
+  color: inherit;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+}
+.logTs,
+.logRequestId {
+  color: rgba(255,255,255,0.58);
+}
+.logMsg {
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.logMeta {
+  font-size: 11px;
+  line-height: 1.6;
+  color: rgba(255,255,255,0.72);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 @keyframes panelFade {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: translateY(0); }
@@ -2264,6 +2366,7 @@ button { font: inherit; cursor: pointer; }
   <nav class="tabbar" aria-label="\u63A7\u5236\u53F0\u5206\u533A">
     <button class="tabBtn active" type="button" data-tab="accounts">\u8D26\u53F7</button>
     <button class="tabBtn" type="button" data-tab="settings">\u4E0A\u6E38\u914D\u7F6E</button>
+    <button class="tabBtn" type="button" data-tab="logs">\u65E5\u5FD7</button>
   </nav>
 </div>
 <div class="shell">
@@ -2348,6 +2451,29 @@ button { font: inherit; cursor: pointer; }
       </div>
     </section>
   </section>
+
+  <section class="tabPanel" data-tab-panel="logs">
+    <section class="panel logsPanel">
+      <div class="logsToolbar">
+        <div>
+          <h2>运行日志</h2>
+          <div class="panelSub">复用 bridge 当前进程日志，展示最近日志并实时追加。</div>
+        </div>
+        <div class="logsActions">
+          <button class="btn" id="refresh-logs-btn">刷新日志</button>
+          <button class="btn" id="toggle-log-follow-btn">自动滚动：开</button>
+        </div>
+      </div>
+      <div class="logsMeta">
+        <span id="log-count">0 条</span>
+        <span id="log-status">等待日志加载</span>
+      </div>
+      <div class="logsViewport" id="logs-viewport">
+        <div class="logEmpty" id="logs-empty">当前还没有可展示的日志。</div>
+        <div class="logList" id="logs-list"></div>
+      </div>
+    </section>
+  </section>
 </div>
 <script>
 const els = {
@@ -2369,7 +2495,14 @@ const els = {
   fallbackTargets: document.getElementById('fallback-targets'),
   fallbackEmpty: document.getElementById('fallback-empty'),
   fallbackStatus: document.getElementById('fallback-status'),
-  fallbackEnvPath: document.getElementById('fallback-env-path')
+  fallbackEnvPath: document.getElementById('fallback-env-path'),
+  refreshLogsBtn: document.getElementById('refresh-logs-btn'),
+  toggleLogFollowBtn: document.getElementById('toggle-log-follow-btn'),
+  logCount: document.getElementById('log-count'),
+  logStatus: document.getElementById('log-status'),
+  logsViewport: document.getElementById('logs-viewport'),
+  logsEmpty: document.getElementById('logs-empty'),
+  logsList: document.getElementById('logs-list')
 };
 const tabButtons = Array.from(document.querySelectorAll('[data-tab]'));
 const tabPanels = Array.from(document.querySelectorAll('[data-tab-panel]'));
@@ -2381,6 +2514,12 @@ let currentTab = 'accounts';
 let refreshInFlight = null;
 let stateStream = null;
 let fallbackDraft = [];
+let logEntries = [];
+let logsLoaded = false;
+let refreshLogsInFlight = null;
+let logFollow = true;
+let latestLogSeq = 0;
+const MAX_RENDERED_LOGS = 300;
 const MSG_ICONS = { info: 'ℹ️', ok: '✅', warn: '⚠️', error: '❌' };
 function setScopedMessage(target, type, text, scope) {
   if (!target) {
@@ -2425,7 +2564,7 @@ function clearConfigMessage() {
   els.configMessage.innerHTML = '';
 }
 function switchTab(tab) {
-  const active = tab === 'settings' ? 'settings' : 'accounts';
+  const active = ['accounts', 'settings', 'logs'].includes(String(tab)) ? String(tab) : 'accounts';
   currentTab = active;
   tabButtons.forEach((button) => {
     button.classList.toggle('active', button.getAttribute('data-tab') === active);
@@ -2434,11 +2573,16 @@ function switchTab(tab) {
     panel.classList.toggle('active', panel.getAttribute('data-tab-panel') === active);
   });
   if (els.primaryTopbar) {
-    const hideTopbar = active === 'settings';
+    const hideTopbar = active !== 'accounts';
     els.primaryTopbar.classList.toggle('tabScopedHidden', hideTopbar);
     els.primaryTopbar.setAttribute('aria-hidden', hideTopbar ? 'true' : 'false');
   }
   try { localStorage.setItem('accio-admin-tab', active); } catch (_) {}
+  if (active === 'logs' && !logsLoaded) {
+    refreshLogs().catch((error) => {
+      setLogStatus((error && error.message) || String(error));
+    });
+  }
 }
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -2640,6 +2784,111 @@ function escapeInline(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+function setLogStatus(text) {
+  if (els.logStatus) {
+    els.logStatus.textContent = text || '';
+  }
+}
+function updateLogMeta() {
+  if (els.logCount) {
+    els.logCount.textContent = String(logEntries.length) + ' 条';
+  }
+  if (els.toggleLogFollowBtn) {
+    els.toggleLogFollowBtn.textContent = '自动滚动：' + (logFollow ? '开' : '关');
+  }
+}
+function scrollLogsToBottom() {
+  if (!els.logsViewport || !logFollow) {
+    return;
+  }
+  els.logsViewport.scrollTop = els.logsViewport.scrollHeight;
+}
+function formatLogMeta(entry) {
+  const meta = { ...entry };
+  delete meta.seq;
+  delete meta.ts;
+  delete meta.level;
+  delete meta.msg;
+  delete meta.requestId;
+
+  const keys = Object.keys(meta);
+  if (keys.length === 0) {
+    return '';
+  }
+
+  try {
+    return JSON.stringify(meta, null, 2);
+  } catch {
+    return keys.map((key) => key + ': ' + String(meta[key])).join('\\n');
+  }
+}
+function renderLogEntry(entry) {
+  const requestId = entry && entry.requestId ? String(entry.requestId) : '';
+  const metaText = formatLogMeta(entry);
+  const level = entry && entry.level ? String(entry.level).toLowerCase() : 'info';
+  return '<article class="logEntry" data-level="' + escapeInline(level) + '" data-seq="' + escapeInline(String(entry && entry.seq ? entry.seq : '')) + '">'
+    + '<div class="logEntryHead">'
+    + '<span class="logLevel">' + escapeInline(level) + '</span>'
+    + '<span class="logTs">' + escapeInline(formatTime(entry && entry.ts ? entry.ts : '')) + '</span>'
+    + (requestId ? '<span class="logRequestId">' + escapeInline(requestId) + '</span>' : '')
+    + '</div>'
+    + '<div class="logMsg">' + escapeInline(entry && entry.msg ? entry.msg : '') + '</div>'
+    + (metaText ? '<pre class="logMeta">' + escapeInline(metaText) + '</pre>' : '')
+    + '</article>';
+}
+function renderLogs() {
+  if (!els.logsList || !els.logsEmpty) {
+    return;
+  }
+  els.logsList.innerHTML = logEntries.map((entry) => renderLogEntry(entry)).join('');
+  els.logsEmpty.style.display = logEntries.length === 0 ? '' : 'none';
+  updateLogMeta();
+  requestAnimationFrame(() => scrollLogsToBottom());
+}
+function replaceLogEntries(entries) {
+  const nextEntries = Array.isArray(entries) ? entries.slice(-MAX_RENDERED_LOGS) : [];
+  logEntries = nextEntries;
+  latestLogSeq = nextEntries.reduce((max, entry) => {
+    const seq = Number(entry && entry.seq ? entry.seq : 0);
+    return Number.isFinite(seq) && seq > max ? seq : max;
+  }, 0);
+  renderLogs();
+}
+function appendLogEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return;
+  }
+
+  const seq = Number(entry.seq || 0);
+  if (Number.isFinite(seq) && seq > 0) {
+    if (logEntries.some((item) => Number(item && item.seq ? item.seq : 0) === seq)) {
+      return;
+    }
+    latestLogSeq = Math.max(latestLogSeq, seq);
+  }
+
+  logEntries = logEntries.concat([entry]).slice(-MAX_RENDERED_LOGS);
+  renderLogs();
+}
+async function refreshLogs() {
+  if (!refreshLogsInFlight) {
+    setLogStatus('正在加载日志...');
+    refreshLogsInFlight = (async () => {
+      const payload = await api('/admin/api/logs?limit=' + MAX_RENDERED_LOGS);
+      const entries = payload && Array.isArray(payload.entries) ? payload.entries : [];
+      replaceLogEntries(entries);
+      logsLoaded = true;
+      setLogStatus(entries.length > 0 ? ('最近刷新：' + formatTime(new Date().toISOString())) : '当前还没有可展示的日志');
+      return payload;
+    })();
+  }
+
+  try {
+    return await refreshLogsInFlight;
+  } finally {
+    refreshLogsInFlight = null;
+  }
 }
 function createFallbackDraftTarget(index) {
   return {
@@ -3014,6 +3263,14 @@ function connectStateStream() {
       }
     } catch (_) {}
   });
+  stateStream.addEventListener('log', (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      appendLogEntry(payload);
+      logsLoaded = true;
+      setLogStatus('实时日志流已连接');
+    } catch (_) {}
+  });
 }
 
 els.refreshBtn.addEventListener('click', async () => {
@@ -3022,6 +3279,22 @@ els.refreshBtn.addEventListener('click', async () => {
   try { await refreshState('界面状态已刷新。'); } catch (e) { setMessage('error', e.message || String(e)); }
   els.refreshBtn.classList.remove('spinning');
 });
+if (els.refreshLogsBtn) {
+  els.refreshLogsBtn.addEventListener('click', () => withAction(els.refreshLogsBtn, async () => {
+    await refreshLogs();
+  }).catch((error) => {
+    setLogStatus((error && error.message) || String(error));
+  }));
+}
+if (els.toggleLogFollowBtn) {
+  els.toggleLogFollowBtn.addEventListener('click', () => {
+    logFollow = !logFollow;
+    updateLogMeta();
+    if (logFollow) {
+      requestAnimationFrame(() => scrollLogsToBottom());
+    }
+  });
+}
 els.logoutBtn.addEventListener('click', () => withAction(els.logoutBtn, async () => { clearMessage(); await api('/admin/api/gateway/logout', { method: 'POST', body: {} }); await refreshState(); setMessage('warn', '已请求 Accio 登出。'); }));
 els.snapshotBtn.addEventListener('click', () => withAction(els.snapshotBtn, async () => { clearMessage(); const actionLabel = els.snapshotBtn.textContent || '保存当前账号'; const payload = await api('/admin/api/snapshots', { method: 'POST', body: {} }); await refreshState(); setMessage('ok', actionLabel + '已完成：' + (payload.alias || 'acct-auto')); }));
 els.accountLoginBtn.addEventListener('click', async () => {
@@ -3306,6 +3579,15 @@ async function handleAdminState(req, res, config, authProvider, recentActivitySt
   writeJson(res, 200, await getSharedAdminState(config, authProvider, recentActivityStore, { fresh }));
 }
 
+async function handleAdminLogs(req, res) {
+  const url = req && req.url ? new URL(req.url, "http://127.0.0.1") : null;
+  const limit = url ? Number(url.searchParams.get("limit") || 200) : 200;
+  writeJson(res, 200, {
+    ok: true,
+    entries: typeof log.getEntries === "function" ? log.getEntries(limit) : []
+  });
+}
+
 let _sharedStateCache = { promise: null, ts: 0 };
 const SHARED_STATE_TTL_MS = 8000;
 
@@ -3366,6 +3648,13 @@ async function handleAdminEvents(req, res, config, authProvider, recentActivityS
         sendState().catch(() => {});
       })
     : () => {};
+  const unsubscribeLogs = typeof log.subscribe === "function"
+    ? log.subscribe((entry) => {
+        if (!closed && !res.writableEnded && !res.destroyed) {
+          writeSse(res, "log", entry);
+        }
+      })
+    : () => {};
 
   const stateTimer = setInterval(() => {
     sendState().catch(() => {});
@@ -3385,6 +3674,7 @@ async function handleAdminEvents(req, res, config, authProvider, recentActivityS
     clearInterval(stateTimer);
     clearInterval(pingTimer);
     unsubscribeRecentActivity();
+    unsubscribeLogs();
   };
 
   req.on("close", cleanup);
@@ -4019,6 +4309,7 @@ async function handleAdminAccountLoginStatus(req, res, config, url) {
 module.exports = {
   handleAdminPage,
   handleAdminState,
+  handleAdminLogs,
   handleAdminEvents,
   handleAdminConfigGet,
   handleAdminConfigTest,

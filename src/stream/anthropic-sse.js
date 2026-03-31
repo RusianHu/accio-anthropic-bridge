@@ -13,6 +13,7 @@ class AnthropicStreamWriter {
     this.sessionId = sessionId || "";
     this.id = id || generateId("msg");
     this.started = false;
+    this.textBlockStarted = false;
   }
 
   start() {
@@ -47,6 +48,16 @@ class AnthropicStreamWriter {
       }
     });
 
+    this.started = true;
+  }
+
+  ensureTextBlock() {
+    this.start();
+
+    if (this.textBlockStarted) {
+      return;
+    }
+
     writeSse(this.res, "content_block_start", {
       type: "content_block_start",
       index: 0,
@@ -56,7 +67,7 @@ class AnthropicStreamWriter {
       }
     });
 
-    this.started = true;
+    this.textBlockStarted = true;
   }
 
   writeRaw(event, data) {
@@ -69,7 +80,7 @@ class AnthropicStreamWriter {
       return;
     }
 
-    this.start();
+    this.ensureTextBlock();
     writeSse(this.res, "content_block_delta", {
       type: "content_block_delta",
       index: 0,
@@ -82,13 +93,24 @@ class AnthropicStreamWriter {
 
   writeToolCalls(toolCalls) {
     this.start();
+    let startIndex = 0;
+
+    if (this.textBlockStarted) {
+      writeSse(this.res, "content_block_stop", {
+        type: "content_block_stop",
+        index: 0
+      });
+      this.textBlockStarted = false;
+      startIndex = 1;
+    }
 
     for (let index = 0; index < toolCalls.length; index += 1) {
       const toolCall = toolCalls[index];
+      const blockIndex = startIndex + index;
 
       writeSse(this.res, "content_block_start", {
         type: "content_block_start",
-        index,
+        index: blockIndex,
         content_block: {
           type: "tool_use",
           id: toolCall.id,
@@ -99,7 +121,7 @@ class AnthropicStreamWriter {
 
       writeSse(this.res, "content_block_delta", {
         type: "content_block_delta",
-        index,
+        index: blockIndex,
         delta: {
           type: "input_json_delta",
           partial_json: JSON.stringify(toolCall.input || {})
@@ -108,7 +130,7 @@ class AnthropicStreamWriter {
 
       writeSse(this.res, "content_block_stop", {
         type: "content_block_stop",
-        index
+        index: blockIndex
       });
     }
   }
@@ -137,10 +159,13 @@ class AnthropicStreamWriter {
   }
 
   finishEndTurn(outputText, inputTokens = this.inputTokens) {
-    writeSse(this.res, "content_block_stop", {
-      type: "content_block_stop",
-      index: 0
-    });
+    if (this.textBlockStarted) {
+      writeSse(this.res, "content_block_stop", {
+        type: "content_block_stop",
+        index: 0
+      });
+      this.textBlockStarted = false;
+    }
 
     writeSse(this.res, "message_delta", {
       type: "message_delta",

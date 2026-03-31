@@ -268,6 +268,112 @@ function hasOpenAiTools(tools) {
   });
 }
 
+function normalizeJsonStringObject(value) {
+  if (!value) {
+    return {};
+  }
+
+  if (typeof value === "object") {
+    return value;
+  }
+
+  try {
+    const parsed = JSON.parse(String(value));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeAnthropicToolDefinitions(tools) {
+  if (!Array.isArray(tools)) {
+    return [];
+  }
+
+  return tools
+    .map((tool) => {
+      if (!tool || typeof tool !== "object" || !tool.name) {
+        return null;
+      }
+
+      return {
+        type: "function",
+        function: {
+          name: String(tool.name),
+          description: tool.description ? String(tool.description) : "",
+          parameters:
+            tool.input_schema && typeof tool.input_schema === "object"
+              ? tool.input_schema
+              : { type: "object", properties: {}, required: [] }
+        }
+      };
+    })
+    .filter(Boolean);
+}
+
+function normalizeAnthropicToolChoice(toolChoice, apiStyle = "chat_completions") {
+  if (!toolChoice || typeof toolChoice !== "object") {
+    return undefined;
+  }
+
+  const type = String(toolChoice.type || "").trim().toLowerCase();
+
+  if (!type || type === "auto") {
+    return "auto";
+  }
+
+  if (type === "any") {
+    return "required";
+  }
+
+  if (type === "tool" && toolChoice.name) {
+    if (apiStyle === "responses") {
+      return {
+        type: "function",
+        name: String(toolChoice.name)
+      };
+    }
+
+    return {
+      type: "function",
+      function: {
+        name: String(toolChoice.name)
+      }
+    };
+  }
+
+  return undefined;
+}
+
+function normalizeAnthropicToolResultText(content) {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return JSON.stringify(content || "");
+  }
+
+  return content
+    .map((block) => {
+      if (!block || typeof block !== "object") {
+        return "";
+      }
+
+      if (block.type === "text") {
+        return block.text || "";
+      }
+
+      if (typeof block.text === "string") {
+        return block.text;
+      }
+
+      return JSON.stringify(block);
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
 function normalizeContentString(content) {
   if (typeof content === "string") {
     return content;
@@ -293,6 +399,96 @@ function normalizeContentString(content) {
     .join("\n");
 }
 
+function normalizeResponsesTextContent(content) {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .map((block) => {
+      if (!block || typeof block !== "object") {
+        return "";
+      }
+
+      if (
+        block.type === "text" ||
+        block.type === "input_text" ||
+        block.type === "output_text"
+      ) {
+        return block.text || "";
+      }
+
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function openAiMessagesToResponsesInput(messages) {
+  const input = [];
+
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+
+    const role = String(message.role || "user");
+    const contentText = normalizeResponsesTextContent(message.content);
+
+    if (role === "tool") {
+      input.push({
+        type: "function_call_output",
+        call_id: String(message.tool_call_id || createFallbackId()),
+        output: contentText || String(message.content || "")
+      });
+      continue;
+    }
+
+    if (role === "assistant") {
+      if (contentText) {
+        input.push({
+          role: "assistant",
+          content: [{ type: "input_text", text: contentText }]
+        });
+      }
+
+      const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      for (const toolCall of toolCalls) {
+        const fn = toolCall && toolCall.function ? toolCall.function : {};
+        if (!fn.name) {
+          continue;
+        }
+
+        input.push({
+          type: "function_call",
+          call_id: String(toolCall.id || createFallbackId()),
+          name: String(fn.name),
+          arguments: typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments || {})
+        });
+      }
+      continue;
+    }
+
+    input.push({
+      role: role === "system" ? "system" : "user",
+      content: [{ type: "input_text", text: contentText || "[Empty]" }]
+    });
+  }
+
+  if (input.length === 0) {
+    input.push({
+      role: "user",
+      content: [{ type: "input_text", text: "[Empty]" }]
+    });
+  }
+
+  return input;
+}
+
 function anthropicToFallbackMessages(body) {
   const messages = [];
   const system = normalizeSystemPrompt(body && body.system);
@@ -305,6 +501,95 @@ function anthropicToFallbackMessages(body) {
     const role = message && message.role === "assistant" ? "assistant" : "user";
     const content = normalizeContent(message && message.content);
     messages.push({ role, content: content || "[Empty]" });
+  }
+
+  if (messages.length === 0) {
+    messages.push({ role: "user", content: flattenAnthropicRequest(body || {}) });
+  }
+
+  return messages;
+}
+
+function anthropicToOpenAiMessages(body) {
+  const messages = [];
+  const system = normalizeSystemPrompt(body && body.system);
+
+  if (system) {
+    messages.push({ role: "system", content: system });
+  }
+
+  for (const message of Array.isArray(body && body.messages) ? body.messages : []) {
+    const role = message && message.role === "assistant" ? "assistant" : "user";
+    const content = Array.isArray(message && message.content)
+      ? message.content
+      : [{ type: "text", text: normalizeContent(message && message.content) || "[Empty]" }];
+
+    if (role === "assistant") {
+      const textParts = [];
+      const toolCalls = [];
+
+      for (const block of content) {
+        if (!block || typeof block !== "object") {
+          continue;
+        }
+
+        if (block.type === "text") {
+          if (block.text) {
+            textParts.push(String(block.text));
+          }
+          continue;
+        }
+
+        if (block.type === "tool_use" && block.name) {
+          toolCalls.push({
+            id: String(block.id || createFallbackId()),
+            type: "function",
+            function: {
+              name: String(block.name),
+              arguments: JSON.stringify(block.input || {})
+            }
+          });
+        }
+      }
+
+      if (textParts.length > 0 || toolCalls.length > 0) {
+        messages.push({
+          role: "assistant",
+          content: textParts.join("\n"),
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {})
+        });
+      }
+
+      continue;
+    }
+
+    const textParts = [];
+
+    for (const block of content) {
+      if (!block || typeof block !== "object") {
+        continue;
+      }
+
+      if (block.type === "tool_result") {
+        messages.push({
+          role: "tool",
+          tool_call_id: String(block.tool_use_id || createFallbackId()),
+          content: normalizeAnthropicToolResultText(block.content)
+        });
+        continue;
+      }
+
+      if (block.type === "text" && block.text) {
+        textParts.push(String(block.text));
+      }
+    }
+
+    if (textParts.length > 0) {
+      messages.push({
+        role: "user",
+        content: textParts.join("\n")
+      });
+    }
   }
 
   if (messages.length === 0) {
@@ -435,6 +720,68 @@ function extractTextFromCompletion(payload) {
   }
 
   return "";
+}
+
+function extractToolCallsFromChatCompletion(payload) {
+  const choice = payload && Array.isArray(payload.choices) ? payload.choices[0] : null;
+  const message = choice && choice.message ? choice.message : null;
+  const toolCalls = Array.isArray(message && message.tool_calls) ? message.tool_calls : [];
+
+  return toolCalls
+    .map((toolCall) => {
+      const fn = toolCall && toolCall.function ? toolCall.function : {};
+      if (!fn.name) {
+        return null;
+      }
+
+      return {
+        id: toolCall.id || createFallbackId(),
+        name: String(fn.name),
+        input: normalizeJsonStringObject(fn.arguments)
+      };
+    })
+    .filter(Boolean);
+}
+
+function extractToolCallsFromResponsesResult(result) {
+  const output = Array.isArray(result && result.raw && result.raw.output) ? result.raw.output : [];
+
+  return output
+    .map((item) => {
+      if (
+        !item ||
+        typeof item !== "object" ||
+        !["tool_call", "function_call"].includes(item.type) ||
+        !item.name
+      ) {
+        return null;
+      }
+
+      return {
+        id: item.call_id || item.id || createFallbackId(),
+        name: String(item.name),
+        input: normalizeJsonStringObject(item.arguments)
+      };
+    })
+    .filter(Boolean);
+}
+
+function extractToolCallsFromAnthropicMessage(payload) {
+  const content = Array.isArray(payload && payload.content) ? payload.content : [];
+
+  return content
+    .map((block) => {
+      if (!block || typeof block !== "object" || block.type !== "tool_use" || !block.name) {
+        return null;
+      }
+
+      return {
+        id: block.id || createFallbackId(),
+        name: String(block.name),
+        input: block.input && typeof block.input === "object" ? block.input : {}
+      };
+    })
+    .filter(Boolean);
 }
 
 function normalizeAnthropicThinking(thinking) {
@@ -570,6 +917,30 @@ function createSseReader(stream) {
       }
     }
   };
+}
+
+function upsertResponseOutputItem(items, item) {
+  if (!item || typeof item !== "object") {
+    return items;
+  }
+
+  const itemId = item.id || item.call_id;
+  if (!itemId) {
+    return items.concat([item]);
+  }
+
+  const next = items.slice();
+  const index = next.findIndex((entry) => entry && (entry.id === itemId || entry.call_id === itemId));
+  if (index >= 0) {
+    next[index] = {
+      ...next[index],
+      ...item
+    };
+    return next;
+  }
+
+  next.push(item);
+  return next;
 }
 
 function shouldFallbackToExternalProvider(error) {
@@ -884,6 +1255,7 @@ class ExternalFallbackClient {
     const reader = createSseReader(response.body);
     let text = "";
     let completedResponse = null;
+    let outputItems = [];
 
     try {
       while (true) {
@@ -914,8 +1286,18 @@ class ExternalFallbackClient {
           continue;
         }
 
+        if (payload.type === "response.output_item.done" && payload.item && typeof payload.item === "object") {
+          outputItems = upsertResponseOutputItem(outputItems, payload.item);
+          continue;
+        }
+
         if (payload.type === "response.completed" && payload.response) {
-          completedResponse = payload.response;
+          completedResponse = {
+            ...payload.response,
+            output: Array.isArray(payload.response.output) && payload.response.output.length > 0
+              ? payload.response.output
+              : outputItems
+          };
           break;
         }
       }
@@ -923,11 +1305,18 @@ class ExternalFallbackClient {
       await reader.cancel();
     }
 
+    const finalResponse = completedResponse || {
+      model: this.model,
+      output: outputItems,
+      usage: null
+    };
+
     return {
-      model: completedResponse && completedResponse.model ? completedResponse.model : this.model,
+      model: finalResponse && finalResponse.model ? finalResponse.model : this.model,
       text,
-      usage: completedResponse && completedResponse.usage ? completedResponse.usage : null,
-      raw: completedResponse
+      toolCalls: extractToolCallsFromResponsesResult({ raw: finalResponse }),
+      usage: finalResponse && finalResponse.usage ? finalResponse.usage : null,
+      raw: finalResponse
     };
   }
 
@@ -954,7 +1343,7 @@ class ExternalFallbackClient {
       return Boolean(body && typeof body === "object");
     }
 
-    if (!body || (Array.isArray(body.tools) && body.tools.length > 0) || hasAnthropicImages(body.messages)) {
+    if (!body || hasAnthropicImages(body.messages)) {
       return false;
     }
 
@@ -977,7 +1366,7 @@ class ExternalFallbackClient {
     return true;
   }
 
-  async complete({ messages, system, maxTokens, temperature, metadata, reasoning }) {
+  async complete({ messages, system, maxTokens, temperature, metadata, reasoning, tools, toolChoice }) {
     if (!this.isConfigured()) {
       throw new Error("External fallback provider is not configured");
     }
@@ -1004,6 +1393,8 @@ class ExternalFallbackClient {
         temperature,
         stream: false,
         metadata: metadata || undefined,
+        ...(Array.isArray(tools) && tools.length > 0 ? { tools } : {}),
+        ...(toolChoice ? { tool_choice: toolChoice } : {}),
         ...(reasoning || {})
       };
 
@@ -1013,12 +1404,30 @@ class ExternalFallbackClient {
           if (endpoint === "responses") {
             const responsesBody = {
               model: this.model,
-              input: messages.map((message) => ({
-                role: message.role || "user",
-                content: [{ type: "input_text", text: String(message.content || "") }]
-              })),
+              input: openAiMessagesToResponsesInput(messages),
               max_output_tokens: maxTokens,
               temperature,
+              ...(Array.isArray(tools) && tools.length > 0
+                ? {
+                    tools: tools.map((tool) => ({
+                      type: "function",
+                      name: tool.function.name,
+                      description: tool.function.description,
+                      parameters: tool.function.parameters
+                    }))
+                  }
+                : {}),
+              ...(toolChoice
+                ? {
+                    tool_choice:
+                      typeof toolChoice === "object" && toolChoice.function
+                        ? {
+                            type: "function",
+                            name: toolChoice.function.name
+                          }
+                        : toolChoice
+                  }
+                : {}),
               ...(reasoning || {})
             };
             const responsesResponse = await this.requestOpenAiResponses(responsesBody);
@@ -1078,6 +1487,7 @@ class ExternalFallbackClient {
     return {
       model: this.model,
       text: isAnthropic ? extractTextFromAnthropicMessage(payload) : extractTextFromCompletion(payload),
+      toolCalls: isAnthropic ? extractToolCallsFromAnthropicMessage(payload) : extractToolCallsFromChatCompletion(payload),
       usage: payload && payload.usage ? payload.usage : null,
       raw: payload
     };
@@ -1096,10 +1506,12 @@ class ExternalFallbackClient {
     }
 
     return this.complete({
-      messages: anthropicToFallbackMessages(body),
+      messages: anthropicToOpenAiMessages(body),
       maxTokens: Number(body && body.max_tokens) || undefined,
       temperature: typeof (body && body.temperature) === "number" ? body.temperature : undefined,
       metadata: { source: "accio-bridge-anthropic-fallback" },
+      tools: normalizeAnthropicToolDefinitions(body && body.tools),
+      toolChoice: normalizeAnthropicToolChoice(body && body.tool_choice),
       reasoning: mapAnthropicThinkingToOpenAiReasoning(body && body.thinking, this.reasoningEffort)
     });
   }
@@ -1226,6 +1638,7 @@ module.exports = {
   anthropicToFallbackMessages,
   normalizeFallbackTarget,
   normalizeFallbackTargets,
+  openAiMessagesToResponsesInput,
   serializeFallbackTarget,
   openAiToAnthropicPayload,
   openAiToFallbackMessages,

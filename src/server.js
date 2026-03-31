@@ -20,6 +20,7 @@ const { handleTraceDetail, handleTraceReplay, handleTracesList } = require("./ro
 const {
   handleAdminPage,
   handleAdminState,
+  handleAdminLogs,
   handleAdminEvents,
   handleAdminConfigGet,
   handleAdminConfigTest,
@@ -155,6 +156,7 @@ function createServer(config, client, directClient, fallbackPool, authProvider, 
           endpoints: [
             "GET /admin",
             "GET /admin/api/state",
+            "GET /admin/api/logs",
             "GET /admin/api/config",
             "POST /admin/api/config/test",
             "POST /admin/api/config",
@@ -191,6 +193,12 @@ function createServer(config, client, directClient, fallbackPool, authProvider, 
 
       if (req.method === "GET" && url.pathname === "/admin/api/state") {
         await handleAdminState(req, res, config, authProvider, recentActivityStore);
+        finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/admin/api/logs") {
+        await handleAdminLogs(req, res);
         finishLog("info", "request completed", { status: res.statusCode || 200, protocol: "admin-api" });
         return;
       }

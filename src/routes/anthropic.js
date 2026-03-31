@@ -108,8 +108,167 @@ function extractAnthropicPayloadText(payload) {
     .join("\n");
 }
 
+function shouldHideAnthropicThinkingBlock(block) {
+  const type = String(block && block.type ? block.type : "").trim().toLowerCase();
+  return type === "thinking" || type === "redacted_thinking";
+}
+
+function stripThinkingFromAnthropicPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return payload;
+  }
+
+  const content = Array.isArray(payload.content) ? payload.content : [];
+  const filteredContent = content.filter((block) => !shouldHideAnthropicThinkingBlock(block));
+
+  if (filteredContent.length === content.length) {
+    return payload;
+  }
+
+  return {
+    ...payload,
+    content: filteredContent
+  };
+}
+
+function remapAnthropicContentIndex(index, hiddenIndexes) {
+  let visibleIndex = index;
+
+  for (const hiddenIndex of hiddenIndexes) {
+    if (hiddenIndex < index) {
+      visibleIndex -= 1;
+    }
+  }
+
+  return visibleIndex;
+}
+
+function filterAnthropicSseEvent(eventName, payload, state) {
+  if (!payload || typeof payload !== "object") {
+    return { eventName, payload };
+  }
+
+  if (
+    eventName === "content_block_start" &&
+    shouldHideAnthropicThinkingBlock(payload.content_block)
+  ) {
+    state.hiddenIndexes.add(Number(payload.index));
+    return null;
+  }
+
+  if (typeof payload.index === "number") {
+    if (state.hiddenIndexes.has(payload.index)) {
+      return null;
+    }
+
+    return {
+      eventName,
+      payload: {
+        ...payload,
+        index: remapAnthropicContentIndex(payload.index, state.hiddenIndexes)
+      }
+    };
+  }
+
+  return { eventName, payload };
+}
+
+async function relayAnthropicStream(upstreamBody, res, includeThinking) {
+  if (!upstreamBody) {
+    return;
+  }
+
+  if (includeThinking) {
+    for await (const chunk of upstreamBody) {
+      if (res.writableEnded || res.destroyed) {
+        break;
+      }
+      res.write(chunk);
+    }
+    return;
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const state = {
+    hiddenIndexes: new Set()
+  };
+
+  const flushEvent = (rawEvent) => {
+    const lines = rawEvent.split("\n");
+    let eventName = "message";
+    const dataLines = [];
+
+    for (const line of lines) {
+      if (line.startsWith("event:")) {
+        eventName = line.slice(6).trim();
+        continue;
+      }
+
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+
+    if (dataLines.length === 0) {
+      return;
+    }
+
+    const rawData = dataLines.join("\n");
+    let payload = null;
+
+    try {
+      payload = JSON.parse(rawData);
+    } catch {
+      if (!res.writableEnded && !res.destroyed) {
+        res.write(rawEvent + "\n\n");
+      }
+      return;
+    }
+
+    const filtered = filterAnthropicSseEvent(eventName, payload, state);
+    if (!filtered || res.writableEnded || res.destroyed) {
+      return;
+    }
+
+    writeSse(res, filtered.eventName, filtered.payload);
+  };
+
+  for await (const chunk of upstreamBody) {
+    if (res.writableEnded || res.destroyed) {
+      break;
+    }
+
+    buffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+    while (true) {
+      const boundaryIndex = buffer.indexOf("\n\n");
+      if (boundaryIndex < 0) {
+        break;
+      }
+
+      const rawEvent = buffer.slice(0, boundaryIndex);
+      buffer = buffer.slice(boundaryIndex + 2);
+
+      if (!rawEvent.trim()) {
+        continue;
+      }
+
+      flushEvent(rawEvent);
+    }
+  }
+
+  buffer += decoder.decode();
+  buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+  if (buffer.trim()) {
+    flushEvent(buffer);
+  }
+}
+
 async function relayExternalAnthropicPassThrough(body, req, res, fallbackClient, binding, cacheState = {}, error = null, phase = null) {
   const transport = fallbackTransportName(fallbackClient);
+  const includeThinking = Boolean(body && body.thinking);
 
   logRequest(req, "anthropic fallback to external provider", {
     transportSelected: transport,
@@ -134,7 +293,8 @@ async function relayExternalAnthropicPassThrough(body, req, res, fallbackClient,
     logRequest(req, "anthropic external fallback streaming passthrough", {
       transportSelected: transport,
       upstreamContentType: contentType,
-      phase
+      phase,
+      thinkingFiltered: !includeThinking
     });
 
     if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -152,14 +312,7 @@ async function relayExternalAnthropicPassThrough(body, req, res, fallbackClient,
       fallbackTransport: transport
     });
 
-    if (upstream.body) {
-      for await (const chunk of upstream.body) {
-        if (res.writableEnded || res.destroyed) {
-          break;
-        }
-        res.write(chunk);
-      }
-    }
+    await relayAnthropicStream(upstream.body, res, includeThinking);
 
     if (!res.writableEnded && !res.destroyed) {
       res.end();
@@ -173,6 +326,9 @@ async function relayExternalAnthropicPassThrough(body, req, res, fallbackClient,
   if (/application\/json/i.test(contentType)) {
     try {
       payload = rawText ? JSON.parse(rawText) : {};
+      if (!includeThinking) {
+        payload = stripThinkingFromAnthropicPayload(payload);
+      }
     } catch {
       payload = null;
     }
@@ -448,6 +604,7 @@ async function tryExternalFallbackAnthropic(body, req, res, fallbackPool, bindin
       });
 
       const result = await fallbackClient.completeAnthropic(body);
+      const toolCalls = Array.isArray(result.toolCalls) ? result.toolCalls : [];
       const inputTokens = estimateTokens(flattenAnthropicRequest(body));
       const outputTokens = result.usage && Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
         ? Number(result.usage.completion_tokens || result.usage.output_tokens || 0)
@@ -476,6 +633,13 @@ async function tryExternalFallbackAnthropic(body, req, res, fallbackPool, bindin
         }
 
         setTraceResponse(req, res, 200, null, { stream: true, fallbackTransport: transport });
+
+        if (toolCalls.length > 0) {
+          writer.writeToolCalls(toolCalls);
+          writer.finishToolUse(promptTokens, outputTokens);
+          return true;
+        }
+
         writer.finishEndTurn(result.text || "", promptTokens);
         return true;
       }
@@ -484,7 +648,8 @@ async function tryExternalFallbackAnthropic(body, req, res, fallbackPool, bindin
         id: generateId("msg"),
         inputTokens: promptTokens,
         outputTokens,
-        sessionId: binding.sessionId || null
+        sessionId: binding.sessionId || null,
+        toolCalls
       });
 
       if (cacheState.cacheKey && cacheState.responseCache) {
@@ -646,6 +811,7 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackPoo
   let streamStarted = false;
   const streamId = generateId("msg");
   let writer = null;
+  const bufferedStreamDeltas = [];
 
   const getWriter = (options = {}) => {
     if (!writer) {
@@ -677,12 +843,9 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackPoo
           return;
         }
 
-        if (!streamStarted) {
-          streamStarted = true;
-        }
-
         if (event.delta) {
-          getWriter({ id: streamId }).writeTextDelta(event.delta);
+          streamStarted = true;
+          bufferedStreamDeltas.push(event.delta);
         }
       }
     });
@@ -735,7 +898,11 @@ async function handleMessagesRequest(req, res, client, directClient, fallbackPoo
       sessionId: result.sessionId
     });
 
-    if (!streamStarted && finalText) {
+    if (bufferedStreamDeltas.length > 0) {
+      for (const delta of bufferedStreamDeltas) {
+        streamWriter.writeTextDelta(delta);
+      }
+    } else if (!streamStarted && finalText) {
       streamWriter.writeTextDelta(finalText);
     }
 

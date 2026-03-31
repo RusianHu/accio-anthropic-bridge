@@ -9,6 +9,7 @@ const {
   ExternalFallbackPool,
   anthropicToFallbackMessages,
   normalizeFallbackTargets,
+  openAiMessagesToResponsesInput,
   openAiToFallbackMessages,
   shouldFallbackToExternalProvider
 } = require("../src/external-fallback");
@@ -45,7 +46,7 @@ test("openAiToFallbackMessages preserves plain text roles", () => {
   ]);
 });
 
-test("ExternalFallbackClient eligibility rejects tools and images while allowing thinking for openai-compatible anthropic fallback", () => {
+test("ExternalFallbackClient eligibility allows anthropic tools for openai-compatible fallback while still rejecting images", () => {
   const client = new ExternalFallbackClient({
     baseUrl: "https://fallback.example/v1",
     apiKey: "key",
@@ -53,7 +54,7 @@ test("ExternalFallbackClient eligibility rejects tools and images while allowing
   });
 
   assert.equal(client.isEligibleAnthropic({ thinking: { type: "enabled" }, messages: [] }), true);
-  assert.equal(client.isEligibleAnthropic({ tools: [{ name: "tool" }], messages: [] }), false);
+  assert.equal(client.isEligibleAnthropic({ tools: [{ name: "tool" }], messages: [] }), true);
   assert.equal(client.isEligibleAnthropic({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://x" } }] }] }), false);
   assert.equal(client.isEligibleOpenAi({ tools: [{ type: "function", function: { name: "tool" } }], messages: [] }), false);
   assert.equal(client.isEligibleOpenAi({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://x" } }] }] }), false);
@@ -163,6 +164,56 @@ test("ExternalFallbackClient maps anthropic thinking to openai reasoning fields"
   assert.deepEqual(payload.reasoning, { effort: "high" });
 });
 
+test("ExternalFallbackClient maps anthropic tools into openai chat completions payload", async () => {
+  const seen = [];
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "key_123",
+    model: "gpt-5.4",
+    protocol: "openai",
+    fetchImpl: async (url, options = {}) => {
+      seen.push({ url: String(url), options });
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [{ message: { content: "fallback ok" } }],
+            usage: { prompt_tokens: 12, completion_tokens: 7 }
+          };
+        }
+      };
+    }
+  });
+
+  await client.completeAnthropic({
+    messages: [
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "tool_1", name: "lookup", input: { q: "hi" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tool_1", content: [{ type: "text", text: "done" }] }] }
+    ],
+    tools: [
+      {
+        name: "lookup",
+        description: "Lookup something",
+        input_schema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] }
+      }
+    ],
+    tool_choice: { type: "tool", name: "lookup" },
+    max_tokens: 123
+  });
+
+  const payload = JSON.parse(seen[0].options.body);
+  assert.equal(payload.model, "gpt-5.4");
+  assert.equal(payload.tools[0].function.name, "lookup");
+  assert.equal(payload.tools[0].function.parameters.required[0], "q");
+  assert.equal(payload.tool_choice.function.name, "lookup");
+  assert.equal(payload.messages[1].tool_calls[0].function.name, "lookup");
+  assert.equal(payload.messages[2].role, "tool");
+  assert.equal(payload.messages[2].tool_call_id, "tool_1");
+  assert.equal(payload.messages[2].content, "done");
+});
+
 test("ExternalFallbackClient uses configured default reasoning effort when anthropic thinking has no budget", async () => {
   const seen = [];
   const client = new ExternalFallbackClient({
@@ -264,6 +315,200 @@ test("ExternalFallbackClient falls back to responses endpoint when chat completi
   assert.equal(payload.metadata, undefined);
   assert.equal(payload.reasoning.effort, "high");
   assert.equal(payload.input[0].content[0].type, "input_text");
+});
+
+test("openAiMessagesToResponsesInput preserves tool call history for responses api", () => {
+  const input = openAiMessagesToResponsesInput([
+    { role: "system", content: "system rule" },
+    { role: "user", content: "check weather" },
+    {
+      role: "assistant",
+      content: "Calling tool",
+      tool_calls: [
+        {
+          id: "call_123",
+          type: "function",
+          function: {
+            name: "lookup_weather",
+            arguments: "{\"city\":\"Shanghai\"}"
+          }
+        }
+      ]
+    },
+    {
+      role: "tool",
+      tool_call_id: "call_123",
+      content: "Sunny"
+    }
+  ]);
+
+  assert.deepEqual(input, [
+    {
+      role: "system",
+      content: [{ type: "input_text", text: "system rule" }]
+    },
+    {
+      role: "user",
+      content: [{ type: "input_text", text: "check weather" }]
+    },
+    {
+      role: "assistant",
+      content: [{ type: "input_text", text: "Calling tool" }]
+    },
+    {
+      type: "function_call",
+      call_id: "call_123",
+      name: "lookup_weather",
+      arguments: "{\"city\":\"Shanghai\"}"
+    },
+    {
+      type: "function_call_output",
+      call_id: "call_123",
+      output: "Sunny"
+    }
+  ]);
+});
+
+test("ExternalFallbackClient extracts responses api function calls when completing anthropic request", async () => {
+  const seen = [];
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "key_123",
+    model: "gpt-5.4",
+    protocol: "openai",
+    openaiApiStyle: "responses",
+    fetchImpl: async (url, options = {}) => {
+      seen.push({ url: String(url), options });
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(
+              'event: response.output_item.added\n' +
+              'data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","status":"in_progress","arguments":"","call_id":"call_weather","name":"lookup_weather"},"output_index":0,"sequence_number":1}\n\n' +
+              'event: response.function_call_arguments.done\n' +
+              'data: {"type":"response.function_call_arguments.done","arguments":"{\\"city\\":\\"Shanghai\\"}","item_id":"fc_1","output_index":0,"sequence_number":2}\n\n' +
+              'event: response.output_item.done\n' +
+              'data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","status":"completed","arguments":"{\\"city\\":\\"Shanghai\\"}","call_id":"call_weather","name":"lookup_weather"},"output_index":0,"sequence_number":3}\n\n' +
+              'event: response.completed\n' +
+              'data: {"type":"response.completed","response":{"id":"resp_123","model":"gpt-5.4","output":[{"id":"fc_1","type":"function_call","status":"completed","arguments":"{\\"city\\":\\"Shanghai\\"}","call_id":"call_weather","name":"lookup_weather"}],"usage":{"input_tokens":10,"output_tokens":5}}}\n\n'
+            ));
+            controller.close();
+          }
+        })
+      };
+    }
+  });
+
+  const result = await client.completeAnthropic({
+    messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+    tools: [{ name: "lookup_weather", input_schema: { type: "object" } }],
+    tool_choice: { type: "tool", name: "lookup_weather" },
+    max_tokens: 32
+  });
+
+  assert.equal(seen[0].url, "https://fallback.example/v1/responses");
+  const payload = JSON.parse(seen[0].options.body);
+  assert.equal(payload.input[0].role, "user");
+  assert.deepEqual(result.toolCalls, [
+    {
+      id: "call_weather",
+      name: "lookup_weather",
+      input: { city: "Shanghai" }
+    }
+  ]);
+});
+
+test("ExternalFallbackClient extracts responses api function calls even without response.completed", async () => {
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "key_123",
+    model: "gpt-5.4",
+    protocol: "openai",
+    openaiApiStyle: "responses",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'event: response.output_item.added\n' +
+            'data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","status":"in_progress","arguments":"","call_id":"call_weather","name":"lookup_weather"},"output_index":0,"sequence_number":1}\n\n' +
+            'event: response.output_item.done\n' +
+            'data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","status":"completed","arguments":"{\\"city\\":\\"Shanghai\\"}","call_id":"call_weather","name":"lookup_weather"},"output_index":0,"sequence_number":2}\n\n'
+          ));
+          controller.close();
+        }
+      })
+    })
+  });
+
+  const result = await client.completeAnthropic({
+    messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+    tools: [{ name: "lookup_weather", input_schema: { type: "object" } }],
+    max_tokens: 32
+  });
+
+  assert.deepEqual(result.toolCalls, [
+    {
+      id: "call_weather",
+      name: "lookup_weather",
+      input: { city: "Shanghai" }
+    }
+  ]);
+});
+
+test("ExternalFallbackClient extracts openai tool calls when completing anthropic request", async () => {
+  const client = new ExternalFallbackClient({
+    baseUrl: "https://fallback.example/v1",
+    apiKey: "key_123",
+    model: "gpt-5.4",
+    protocol: "openai",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "",
+                tool_calls: [
+                  {
+                    id: "call_1",
+                    type: "function",
+                    function: {
+                      name: "lookup",
+                      arguments: "{\"q\":\"hello\"}"
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          usage: { prompt_tokens: 12, completion_tokens: 7 }
+        };
+      }
+    })
+  });
+
+  const result = await client.completeAnthropic({
+    messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+    tools: [{ name: "lookup", input_schema: { type: "object" } }],
+    max_tokens: 32
+  });
+
+  assert.equal(result.text, "");
+  assert.deepEqual(result.toolCalls, [
+    {
+      id: "call_1",
+      name: "lookup",
+      input: { q: "hello" }
+    }
+  ]);
 });
 
 test("ExternalFallbackClient completes through Anthropic endpoint", async () => {
